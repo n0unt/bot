@@ -11,13 +11,13 @@ from discord import app_commands
 import os, asyncio, datetime, json
 
 # ── Config ────────────────────────────────────────────────────
-TOKEN         = os.environ.get("DISCORD_BOT_TOKEN", "")
+TOKEN         = os.environ.get("DISCORD_BOT_TOKEN", "MTQ3NTAyMzI5MzA5MzI0OTIwNg.G6frac.bovDyegM6wi-E1_fvLBB6HoGQY961Sk545EzLk")
 GUILD_ID      = int(os.environ.get("DISCORD_GUILD_ID", "1475014802194567238"))
 
 # Channel IDs — set these to your actual channel IDs
-TICKET_CATEGORY_ID  = int(os.environ.get("TICKET_CATEGORY_ID",  "0"))
-TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       "0"))
-CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID","0"))
+TICKET_CATEGORY_ID  = int(os.environ.get("TICKET_CATEGORY_ID",  "1475173808620044318"))
+TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       "1475173851339030588"))
+CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID","1475015328609079371"))
 
 # Role IDs
 ROLE_LITE = 1475015141882855424
@@ -320,4 +320,5 @@ if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: DISCORD_BOT_TOKEN env var not set")
         exit(1)
+
     bot.run(TOKEN)
