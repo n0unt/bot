@@ -15,9 +15,9 @@ TOKEN         = os.environ.get("DISCORD_BOT_TOKEN", "")
 GUILD_ID      = int(os.environ.get("DISCORD_GUILD_ID", "1475014802194567238"))
 
 # Channel IDs — set these to your actual channel IDs
-TICKET_CATEGORY_ID  = int(os.environ.get("TICKET_CATEGORY_ID",  ""))
-TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       ""))
-CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID",""))
+TICKET_CATEGORY_ID  = int(os.environ.get("TICKET_CATEGORY_ID",  "0"))
+TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       "0"))
+CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID","0"))
 
 # Role IDs
 ROLE_LITE = 1475015141882855424
@@ -264,7 +264,16 @@ async def announce(
         if attachment.content_type and attachment.content_type.startswith("image/"):
             embed.set_image(url=f"attachment://{attachment.filename}")
 
-    await channel.send(content=content, embed=embed, file=file)
+    # Use allowed_mentions to fire the ping exactly once
+    if ping:
+        allowed = discord.AllowedMentions(everyone=ping.name == "@everyone",
+                                          roles=[ping] if ping.name != "@everyone" else [],
+                                          users=False)
+    else:
+        allowed = discord.AllowedMentions.none()
+
+    await channel.send(content=content, embed=embed, file=file,
+                       allowed_mentions=allowed)
     await interaction.response.send_message(
         f"✅ Posted to {channel.mention}!", ephemeral=True)
 
@@ -321,5 +330,3 @@ if __name__ == "__main__":
         print("ERROR: DISCORD_BOT_TOKEN env var not set")
         exit(1)
     bot.run(TOKEN)
-
-
