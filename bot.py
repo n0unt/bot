@@ -20,10 +20,10 @@ TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       "0"))
 CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID","0"))
 
 # Role IDs
-ROLE_LITE = 1475015141882855424
+ROLE_COMET = 1475015141882855424
 ROLE_UFF  = 1475022240754962452
 ROLE_FFL  = 1475022200095510621
-SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", str(ROLE_LITE)))
+SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", str(ROLE_COMET)))
 
 # ── Bot setup ─────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -152,7 +152,7 @@ class TicketControlView(discord.ui.View):
 
 @tree.command(name="ticket-panel", description="Post the ticket creation panel (owner only)",
               guild=discord.Object(id=GUILD_ID))
-@app_commands.checks.has_role(ROLE_LITE)
+@app_commands.checks.has_role(ROLE_COMET)
 async def ticket_panel(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎫 Comet Support",
@@ -180,7 +180,7 @@ async def ticket_panel(interaction: discord.Interaction):
     description="Full changelog — use \\n for new lines",
     attachment="Optional image or file to attach"
 )
-@app_commands.checks.has_role(ROLE_LITE)
+@app_commands.checks.has_role(ROLE_COMET)
 async def changelog(
     interaction: discord.Interaction,
     version: str,
@@ -233,7 +233,7 @@ async def changelog(
     ping="Optional role to ping",
     attachment="Optional image or file"
 )
-@app_commands.checks.has_role(ROLE_LITE)
+@app_commands.checks.has_role(ROLE_COMET)
 async def announce(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
