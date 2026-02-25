@@ -1,5 +1,5 @@
 """
-Lite Discord Bot
+Comet Discord Bot
 - Ticket system (create/close/claim tickets)
 - Changelog command for posting updates with images/files
 - Role management helpers
@@ -155,7 +155,7 @@ class TicketControlView(discord.ui.View):
 @app_commands.checks.has_role(ROLE_LITE)
 async def ticket_panel(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🎫 Lite Support",
+        title="🎫 Comet Support",
         description=(
             "Need help? Click below to open a private support ticket.\n\n"
             "**What to include:**\n"
@@ -166,7 +166,7 @@ async def ticket_panel(interaction: discord.Interaction):
         ),
         color=0x00f5a0
     )
-    embed.set_footer(text="Lite Forensic Platform")
+    embed.set_footer(text="Comet Forensic Platform")
     view = TicketCreateView()
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("✅ Ticket panel posted.", ephemeral=True)
@@ -203,7 +203,7 @@ async def changelog(
         timestamp=datetime.datetime.utcnow()
     )
     embed.set_author(
-        name=f"Lite Scanner  ·  {version}",
+        name=f"Comet Scanner  ·  {version}",
         icon_url=interaction.guild.icon.url if interaction.guild.icon else None
     )
     embed.set_footer(
@@ -309,7 +309,7 @@ async def on_ready():
         print(f"✓ Synced {len(synced)} slash commands")
     except Exception as e:
         print(f"✗ Command sync error: {e}")
-    print(f"✓ Lite Bot online as {bot.user} ({bot.user.id})")
+    print(f"✓ Comet Bot online as {bot.user} ({bot.user.id})")
     print(f"  Guild:      {GUILD_ID}")
     print(f"  Changelog:  #{CHANGELOG_CHANNEL_ID}")
     print(f"  Ticket cat: #{TICKET_CATEGORY_ID}")
@@ -319,7 +319,7 @@ async def on_ready():
 async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingRole):
         await interaction.response.send_message(
-            "❌ You need the **Lite** role to use this command.", ephemeral=True)
+            "❌ You need the **Comet** role to use this command.", ephemeral=True)
     else:
         print(f"Command error: {error}")
         await interaction.response.send_message(f"❌ {error}", ephemeral=True)
