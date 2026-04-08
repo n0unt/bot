@@ -1,332 +1,954 @@
 """
-Comet Discord Bot
-- Ticket system (create/close/claim tickets)
-- Changelog command for posting updates with images/files
-- Role management helpers
+UFF Discord Bot — Python
+United Flag Football League — QBB Ranked System
+
+FLOW:
+  1. /ranked_qbb → challenger selects opponent + teams + game link
+  2. Bot DMs the opponent with Accept / Decline buttons (NO public post yet)
+  3. Opponent clicks:
+       Decline → opponent DM updated, challenger gets a DM saying declined. Done.
+       Accept  → public matchup embed posts to QBB channel with @here ping
+  4. /qbb_results → submit screenshot + winner → ELO updated, results embed posted
 """
 
 import discord
-from discord.ext import commands
 from discord import app_commands
-import os, asyncio, datetime, json
+from discord.ext import commands
+import json
+import os
+from datetime import datetime, timedelta
 
-# ── Config ────────────────────────────────────────────────────
-TOKEN         = os.environ.get("DISCORD_BOT_TOKEN", "")
-GUILD_ID      = int(os.environ.get("DISCORD_GUILD_ID", "1475014802194567238"))
+# ─────────────────────────────────────────────────────────────────────
+# ENVIRONMENT VARIABLES  (set these in Railway)
+# ─────────────────────────────────────────────────────────────────────
+#  DISCORD_BOT_TOKEN  — your bot token
+#  OWNER_DISCORD_ID   — your Discord user ID (auto-admin)
+#  SECRET_KEY         — keep from old bot
+#  QBB_CHANNEL_ID     — channel ID where QBB embeds post
+#
+# OPTIONAL image vars (add these in Railway if you want banners):
+#  UFF_THUMBNAIL_URL  — small icon top-right of every embed
+#  UFF_BANNER_URL     — large banner image shown in QBB matchup embed
+# ─────────────────────────────────────────────────────────────────────
+TOKEN          = os.getenv("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+OWNER_ID       = int(os.getenv("OWNER_DISCORD_ID", "0"))
+SECRET_KEY     = os.getenv("SECRET_KEY", "")
+QBB_CHANNEL_ID = int(os.getenv("QBB_CHANNEL_ID", "0"))
 
-# Channel IDs — set these to your actual channel IDs
-TICKET_CATEGORY_ID  = int(os.environ.get("TICKET_CATEGORY_ID",  "0"))
-TICKET_LOG_ID       = int(os.environ.get("TICKET_LOG_ID",       "0"))
-CHANGELOG_CHANNEL_ID= int(os.environ.get("CHANGELOG_CHANNEL_ID","0"))
+UFF_THUMBNAIL  = os.getenv("UFF_THUMBNAIL_URL", "")
+UFF_BANNER     = os.getenv("UFF_BANNER_URL",    "")
 
-# Role IDs
-ROLE_COMET = 1475015141882855424
-ROLE_UFF  = 1475022240754962452
-ROLE_FFL  = 1475022200095510621
-SUPPORT_ROLE_ID = int(os.environ.get("SUPPORT_ROLE_ID", str(ROLE_COMET)))
+DATA_FILE = "uff_data.json"
 
-# ── Bot setup ─────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
+UFF_FOOTER = "United Flag Football League"
+UFF_COLOR  = 0xF0C040   # gold
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+# ─────────────────────────────────────────────────────────────────────
+# ELO CONFIG
+# ─────────────────────────────────────────────────────────────────────
+STARTING_ELO     = 900
+WIN_ELO          = 100
+LOSS_ELO         = 100
+COOLDOWN_MINUTES = 45
 
-# ── Ticket Views ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# ROLES ALLOWED TO START A QBB
+# ─────────────────────────────────────────────────────────────────────
+QBB_ALLOWED_ROLE_IDS = {
+    1269693904815521994,  # QBB Captain
+    1404271074623099040,  # Moderators
+    1404271002241728617,  # League Boards
+    1429344923865448550,  # Operations Director
+    1262200419686285342,  # Commissioner
+    1401450124424642561,  # Founder
+}
 
-class TicketCreateView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+# ─────────────────────────────────────────────────────────────────────
+# TEAMS  (20 official UFF teams)
+# ─────────────────────────────────────────────────────────────────────
+TEAMS = [
+    ("Shiroishi Samurai",          "SHI",  0x4d4d4e),
+    ("Vicksburg Vortex",           "VIC",  0x230552),
+    ("Salt Lake City Sentinels",   "SLC",  0xdb0e16),
+    ("Nashville Nightmares",       "NSH",  0x5b00c4),
+    ("Warwick Warhawks",           "WAR",  0x27833d),
+    ("Sunny Isle Sea Serpents",    "SISS", 0x00b6ba),
+    ("Los Angeles Golden Knights", "LGK",  0xf5be23),
+    ("Michigan Mustangs",          "MMS",  0xfe001f),
+    ("Portsmouth Panthers",        "PORT", 0x01a1f2),
+    ("Columbus Colts",             "COL",  0x184da7),
+    ("Milwaukee Rams",             "MIL",  0xc5aa76),
+    ("Salisbury Falcons",          "SALI", 0x052270),
+    ("Savannah Raiders",           "SAV",  0xbb0620),
+    ("Highridge Huskies",          "HIG",  0x767878),
+    ("Deltabay Dolphins",          "DTB",  0x0099fc),
+    ("Seattle Skyclaws",           "SEA",  0x004a8b),
+    ("Alabama Bloom",              "AL",   0xf7adad),
+    ("Oklahoma City Owls",         "OKC",  0x67112a),
+    ("Myrtle Beach Hammerheads",   "MYB",  0x215792),
+    ("Windy City Warriors",        "WC",   0x4126a5),
+]
 
-    @discord.ui.button(label="Open a Ticket", style=discord.ButtonStyle.green,
-                       emoji="🎫", custom_id="ticket_open")
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        user  = interaction.user
+# ─────────────────────────────────────────────────────────────────────
+# DATA HELPERS
+# ─────────────────────────────────────────────────────────────────────
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {"players": {}, "matches": [], "pending": {}}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
 
-        existing = discord.utils.get(guild.text_channels, name=f"ticket-{user.name.lower()[:20]}")
-        if existing:
-            await interaction.response.send_message(
-                f"You already have an open ticket: {existing.mention}", ephemeral=True)
-            return
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
-        category = None
-        if TICKET_CATEGORY_ID:
-            category = guild.get_channel(TICKET_CATEGORY_ID)
-        if not category:
-            category = discord.utils.get(guild.categories, name="Tickets")
-            if not category:
-                category = await guild.create_category("Tickets")
-
-        support_role = guild.get_role(SUPPORT_ROLE_ID)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+def get_player(data, user_id: int):
+    uid = str(user_id)
+    if uid not in data["players"]:
+        data["players"][uid] = {
+            "elo": STARTING_ELO,
+            "wins": 0,
+            "losses": 0,
+            "last_game": None,
+            "username": ""
         }
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(
-                read_messages=True, send_messages=True, manage_channels=True)
+    return data["players"][uid]
 
-        ch_name = f"ticket-{user.name.lower()[:20]}"
-        channel = await guild.create_text_channel(
-            ch_name, category=category, overwrites=overwrites,
-            topic=f"Ticket opened by {user} ({user.id})")
+def get_rank(elo: int):
+    """Returns (rank_name, emoji, embed_color)."""
+    if elo >= 2100: return "Amethyst III", "💎", 0xA040E8
+    if elo >= 1900: return "Amethyst II",  "💎", 0xA040E8
+    if elo >= 1700: return "Amethyst I",   "💎", 0xA040E8
+    if elo >= 1500: return "Gold III",     "🥇", 0xF0C040
+    if elo >= 1300: return "Gold II",      "🥇", 0xF0C040
+    if elo >= 1100: return "Gold I",       "🥇", 0xF0C040
+    if elo >= 900:  return "Iron III",     "⚙️",  0x8090A0
+    if elo >= 700:  return "Iron II",      "⚙️",  0x8090A0
+    return               "Iron I",        "⚙️",  0x8090A0
 
-        embed = discord.Embed(
-            title="🎫 Support Ticket",
-            description=(
-                f"Welcome {user.mention}!\n\n"
-                "Please describe your issue and a staff member will assist you shortly.\n\n"
-                "Click **Close Ticket** when your issue is resolved."
-            ),
-            color=0x00f5a0,
-            timestamp=datetime.datetime.utcnow()
-        )
-        embed.set_author(name=str(user), icon_url=user.display_avatar.url)
-        embed.set_footer(text=f"Ticket ID: {channel.id}")
-
-        view = TicketControlView()
-        msg  = await channel.send(content=f"{user.mention}", embed=embed, view=view)
-        await msg.pin()
-
-        await interaction.response.send_message(
-            f"✅ Ticket created: {channel.mention}", ephemeral=True)
-
-        if TICKET_LOG_ID:
-            log_ch = guild.get_channel(TICKET_LOG_ID)
-            if log_ch:
-                log_embed = discord.Embed(
-                    title="Ticket Opened",
-                    description=f"**User:** {user.mention} (`{user.id}`)\n**Channel:** {channel.mention}",
-                    color=0x00f5a0, timestamp=datetime.datetime.utcnow())
-                await log_ch.send(embed=log_embed)
-
-
-class TicketControlView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red,
-                       emoji="🔒", custom_id="ticket_close")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
-        is_staff = support_role and support_role in interaction.user.roles
-        is_admin = interaction.user.guild_permissions.administrator
-        if not (is_staff or is_admin):
-            await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🔒 Closing Ticket",
-            description=f"Closed by {interaction.user.mention}. Deleting in 5 seconds.",
-            color=0xff4d6d, timestamp=datetime.datetime.utcnow())
-        await interaction.response.send_message(embed=embed)
-
-        if TICKET_LOG_ID:
-            log_ch = interaction.guild.get_channel(TICKET_LOG_ID)
-            if log_ch:
-                log_embed = discord.Embed(
-                    title="Ticket Closed",
-                    description=f"**Channel:** #{interaction.channel.name}\n**Closed by:** {interaction.user.mention}",
-                    color=0xff4d6d, timestamp=datetime.datetime.utcnow())
-                await log_ch.send(embed=log_embed)
-
-        await asyncio.sleep(5)
-        await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.blurple,
-                       emoji="✋", custom_id="ticket_claim")
-    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
-        if not (support_role in interaction.user.roles or interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            description=f"✋ {interaction.user.mention} has claimed this ticket.",
-            color=0x4d9fff)
-        await interaction.response.send_message(embed=embed)
-
-
-# ── Slash Commands ────────────────────────────────────────────
-
-@tree.command(name="ticket-panel", description="Post the ticket creation panel (owner only)",
-              guild=discord.Object(id=GUILD_ID))
-@app_commands.checks.has_role(ROLE_COMET)
-async def ticket_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🎫 Comet Support",
-        description=(
-            "Need help? Click below to open a private support ticket.\n\n"
-            "**What to include:**\n"
-            "• Your issue in detail\n"
-            "• Screenshots if relevant\n"
-            "• Your Discord and Roblox username\n\n"
-            "*Tickets are private — only you and staff can see them.*"
-        ),
-        color=0x00f5a0
-    )
-    embed.set_footer(text="Comet Forensic Platform")
-    view = TicketCreateView()
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message("✅ Ticket panel posted.", ephemeral=True)
-
-
-@tree.command(name="changelog", description="Post a changelog update (owner only)",
-              guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(
-    version="Version tag (e.g. v3.1)",
-    title="Short update title",
-    description="Full changelog — use \\n for new lines",
-    attachment="Optional image or file to attach"
-)
-@app_commands.checks.has_role(ROLE_COMET)
-async def changelog(
-    interaction: discord.Interaction,
-    version: str,
-    title: str,
-    description: str,
-    attachment: discord.Attachment = None
-):
-    ch = interaction.guild.get_channel(CHANGELOG_CHANNEL_ID)
-    if not ch:
-        await interaction.response.send_message(
-            "❌ Changelog channel not found. Set `CHANGELOG_CHANNEL_ID` env var.", ephemeral=True)
-        return
-
-    description = description.replace("\\n", "\n")
-
-    embed = discord.Embed(
-        title=f"📋 {title}",
-        description=description,
-        color=0x00f5a0,
-        timestamp=datetime.datetime.utcnow()
-    )
-    embed.set_author(
-        name=f"Comet Scanner  ·  {version}",
-        icon_url=interaction.guild.icon.url if interaction.guild.icon else None
-    )
-    embed.set_footer(
-        text=f"Posted by {interaction.user}",
-        icon_url=interaction.user.display_avatar.url
-    )
-
-    file = None
-    if attachment:
-        import io, aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(attachment.url) as resp:
-                data = await resp.read()
-        file = discord.File(io.BytesIO(data), filename=attachment.filename)
-        if attachment.content_type and attachment.content_type.startswith("image/"):
-            embed.set_image(url=f"attachment://{attachment.filename}")
-
-    await ch.send(embed=embed, file=file)
-    await interaction.response.send_message(f"✅ Changelog posted to {ch.mention}!", ephemeral=True)
-
-
-@tree.command(name="announce", description="Post an announcement to any channel (owner only)",
-              guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(
-    channel="Channel to post in",
-    message="Message text — use \\n for new lines",
-    ping="Optional role to ping",
-    attachment="Optional image or file"
-)
-@app_commands.checks.has_role(ROLE_COMET)
-async def announce(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    message: str,
-    ping: discord.Role = None,
-    attachment: discord.Attachment = None
-):
-    message = message.replace("\\n", "\n")
-    embed = discord.Embed(
-        description=message,
-        color=0x00f5a0,
-        timestamp=datetime.datetime.utcnow()
-    )
-    embed.set_author(
-        name=interaction.user.display_name,
-        icon_url=interaction.user.display_avatar.url
-    )
-
-    file    = None
-    content = ping.mention if ping else None
-
-    if attachment:
-        import io, aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(attachment.url) as resp:
-                data = await resp.read()
-        file = discord.File(io.BytesIO(data), filename=attachment.filename)
-        if attachment.content_type and attachment.content_type.startswith("image/"):
-            embed.set_image(url=f"attachment://{attachment.filename}")
-
-    # Use allowed_mentions to fire the ping exactly once
-    if ping:
-        allowed = discord.AllowedMentions(everyone=ping.name == "@everyone",
-                                          roles=[ping] if ping.name != "@everyone" else [],
-                                          users=False)
+def get_tokens(elo: int) -> str:
+    """Token progress bar within current 200-ELO sub-rank tier."""
+    tier_size = 200
+    if elo >= 2100:
+        offset = elo - 2100
+    elif elo >= 1100:
+        offset = (elo - 1100) % tier_size
     else:
-        allowed = discord.AllowedMentions.none()
+        offset = max(0, elo) % tier_size
+    prog = min(int(offset // (tier_size / 3)), 3)
+    return f"{prog}/3"
 
-    await channel.send(content=content, embed=embed, file=file,
-                       allowed_mentions=allowed)
-    await interaction.response.send_message(
-        f"✅ Posted to {channel.mention}!", ephemeral=True)
+def on_cooldown(data, user_id: int):
+    p = get_player(data, user_id)
+    if not p["last_game"]:
+        return False, None
+    last = datetime.fromisoformat(p["last_game"])
+    diff = last + timedelta(minutes=COOLDOWN_MINUTES) - datetime.utcnow()
+    if diff.total_seconds() > 0:
+        m = int(diff.total_seconds() // 60)
+        s = int(diff.total_seconds() % 60)
+        return True, f"{m}m {s}s"
+    return False, None
 
+def is_admin(interaction: discord.Interaction) -> bool:
+    return (
+        interaction.user.id == OWNER_ID
+        or interaction.user.guild_permissions.administrator
+    )
 
-@tree.command(name="close", description="Close the current ticket",
-              guild=discord.Object(id=GUILD_ID))
-async def close_cmd(interaction: discord.Interaction):
-    if not interaction.channel.name.startswith("ticket-"):
-        await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
-        return
-    support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
-    is_staff = support_role and support_role in interaction.user.roles
-    if not (is_staff or interaction.user.guild_permissions.administrator):
-        await interaction.response.send_message("Only staff can use this.", ephemeral=True)
-        return
+def apply_branding(embed: discord.Embed) -> discord.Embed:
+    if UFF_THUMBNAIL:
+        embed.set_thumbnail(url=UFF_THUMBNAIL)
+    return embed
+
+async def get_qbb_channel(guild: discord.Guild):
+    if QBB_CHANNEL_ID:
+        ch = guild.get_channel(QBB_CHANNEL_ID)
+        if ch:
+            return ch
+    return None
+
+def build_matchup_embed(
+    challenger: discord.Member,
+    opponent: discord.Member,
+    your_team: str,
+    opponent_team: str,
+    game_link: str,
+    match_id: str,
+    guild: discord.Guild,
+    data: dict,
+    accepted: bool = False
+) -> discord.Embed:
+    """Build the VS matchup embed used both in DMs (preview) and in the public channel."""
+    p1 = get_player(data, challenger.id)
+    p2 = get_player(data, opponent.id)
+    e1, e2 = p1["elo"], p2["elo"]
+    r1, emoji1, _ = get_rank(e1)
+    r2, emoji2, _ = get_rank(e2)
+
     embed = discord.Embed(
-        title="🔒 Closing Ticket",
-        description=f"Closed by {interaction.user.mention}. Deleting in 5 seconds.",
-        color=0xff4d6d)
-    await interaction.response.send_message(embed=embed)
-    await asyncio.sleep(5)
-    await interaction.channel.delete()
+        title="🏈 Arena QBB Matchup",
+        color=UFF_COLOR
+    )
+
+    embed.add_field(
+        name=f"🟡 {challenger.display_name}",
+        value=(
+            f"<@{challenger.id}>\n"
+            f"**{your_team}**\n"
+            f"Rank: `{emoji1} {r1}`\n"
+            f"Tokens: 🪙 `{get_tokens(e1)}`"
+        ),
+        inline=True
+    )
+    embed.add_field(name="\u200b", value="**— VS —**", inline=True)
+    embed.add_field(
+        name=f"🔵 {opponent.display_name}",
+        value=(
+            f"<@{opponent.id}>\n"
+            f"**{opponent_team}**\n"
+            f"Rank: `{emoji2} {r2}`\n"
+            f"Tokens: 🪙 `{get_tokens(e2)}`"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="🔗 Game Link",
+        value=f"[**Click here to join →**]({game_link})",
+        inline=False
+    )
+
+    if UFF_BANNER:
+        embed.set_image(url=UFF_BANNER)
+
+    if UFF_THUMBNAIL:
+        embed.set_thumbnail(url=UFF_THUMBNAIL)
+    elif guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
+    embed.set_footer(
+        text=f"Challenge issued by {challenger.display_name} | {status} • /qbb_results when done"
+    )
+    embed.timestamp = datetime.utcnow()
+    return embed
 
 
-# ── Events ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# ACCEPT / DECLINE BUTTON VIEW
+# ─────────────────────────────────────────────────────────────────────
+class QBBChallengeView(discord.ui.View):
+    """
+    Sent via DM to the opponent.
+    Stores all match info needed to post the public embed on accept.
+    """
+
+    def __init__(
+        self,
+        match_id: str,
+        challenger_id: int,
+        opponent_id: int,
+        challenger_name: str,
+        opponent_name: str,
+        challenger_team: str,
+        opponent_team: str,
+        game_link: str,
+        guild_id: int,
+    ):
+        super().__init__(timeout=1800)  # 30-minute window to respond
+        self.match_id        = match_id
+        self.challenger_id   = challenger_id
+        self.opponent_id     = opponent_id
+        self.challenger_name = challenger_name
+        self.opponent_name   = opponent_name
+        self.challenger_team = challenger_team
+        self.opponent_team   = opponent_team
+        self.game_link       = game_link
+        self.guild_id        = guild_id
+        self.responded       = False
+
+    async def on_timeout(self):
+        # Disable buttons quietly when the view expires
+        for item in self.children:
+            item.disabled = True
+
+    # ── ACCEPT ───────────────────────────────────────────────────────
+    @discord.ui.button(label="✅  Accept Challenge", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opponent_id:
+            await interaction.response.send_message(
+                "❌ Only the challenged player can respond.", ephemeral=True
+            )
+            return
+
+        if self.responded:
+            await interaction.response.send_message(
+                "This challenge has already been answered.", ephemeral=True
+            )
+            return
+        self.responded = True
+        self.stop()
+
+        # Disable buttons so they can't be clicked again
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+        data = load_data()
+
+        # Get guild and members
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await interaction.response.send_message("❌ Could not find the server.", ephemeral=True)
+            return
+
+        challenger = guild.get_member(self.challenger_id)
+        opponent   = guild.get_member(self.opponent_id)
+
+        if not challenger or not opponent:
+            await interaction.response.send_message(
+                "❌ Could not find one of the players in the server.", ephemeral=True
+            )
+            return
+
+        # Build the public matchup embed
+        embed = build_matchup_embed(
+            challenger=challenger,
+            opponent=opponent,
+            your_team=self.challenger_team,
+            opponent_team=self.opponent_team,
+            game_link=self.game_link,
+            match_id=self.match_id,
+            guild=guild,
+            data=data,
+            accepted=True
+        )
+
+        header = (
+            f"@here 🏟️ **LFG Arena Challenge — ACCEPTED**\n"
+            f"**{challenger.display_name}** vs **{opponent.display_name}** is going live!"
+        )
+
+        # Post to QBB channel
+        ch = await get_qbb_channel(guild)
+        if ch:
+            await ch.send(content=header, embed=embed)
+        else:
+            # Fallback: try to DM both players the embed
+            try:
+                await challenger.send(content="⚠️ QBB channel not set. Here's the matchup:", embed=embed)
+            except discord.Forbidden:
+                pass
+
+        # Update opponent's DM to show accepted
+        accepted_embed = discord.Embed(
+            title="✅ Challenge Accepted!",
+            description=(
+                f"You accepted **{self.challenger_name}**'s challenge!\n\n"
+                f"The matchup has been posted to the QBB channel.\n"
+                f"🔗 [Join the game]({self.game_link})"
+            ),
+            color=0x57F287
+        )
+        accepted_embed.set_footer(text=UFF_FOOTER)
+        await interaction.response.edit_message(embed=accepted_embed, view=self)
+
+        # DM the challenger that the challenge was accepted
+        try:
+            notify = discord.Embed(
+                title="✅ Challenge Accepted!",
+                description=(
+                    f"**{self.opponent_name}** accepted your QBB challenge!\n\n"
+                    f"The matchup has been posted to the QBB channel.\n"
+                    f"🔗 [Join the game]({self.game_link})\n\n"
+                    f"Use `/qbb_results` when the game is over."
+                ),
+                color=0x57F287
+            )
+            notify.set_footer(text=UFF_FOOTER)
+            await challenger.send(embed=notify)
+        except discord.Forbidden:
+            pass  # Challenger has DMs off — not a blocker
+
+    # ── DECLINE ──────────────────────────────────────────────────────
+    @discord.ui.button(label="❌  Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opponent_id:
+            await interaction.response.send_message(
+                "❌ Only the challenged player can respond.", ephemeral=True
+            )
+            return
+
+        if self.responded:
+            await interaction.response.send_message(
+                "This challenge has already been answered.", ephemeral=True
+            )
+            return
+        self.responded = True
+        self.stop()
+
+        for item in self.children:
+            item.disabled = True
+
+        # Remove pending match so it doesn't linger
+        data = load_data()
+        if self.match_id in data.get("pending", {}):
+            del data["pending"][self.match_id]
+            save_data(data)
+
+        # Update opponent DM
+        declined_embed = discord.Embed(
+            title="❌ Challenge Declined",
+            description=f"You declined **{self.challenger_name}**'s QBB challenge.",
+            color=0xED4245
+        )
+        declined_embed.set_footer(text=UFF_FOOTER)
+        await interaction.response.edit_message(embed=declined_embed, view=self)
+
+        # DM the challenger
+        guild  = bot.get_guild(self.guild_id)
+        challenger = guild.get_member(self.challenger_id) if guild else None
+        if challenger:
+            try:
+                notify = discord.Embed(
+                    title="❌ Challenge Declined",
+                    description=(
+                        f"**{self.opponent_name}** declined your QBB challenge.\n"
+                        f"No match was recorded. You're free to challenge someone else!"
+                    ),
+                    color=0xED4245
+                )
+                notify.set_footer(text=UFF_FOOTER)
+                await challenger.send(embed=notify)
+            except discord.Forbidden:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BOT SETUP
+# ─────────────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    bot.add_view(TicketCreateView())
-    bot.add_view(TicketControlView())
-    try:
-        synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
-        print(f"✓ Synced {len(synced)} slash commands")
-    except Exception as e:
-        print(f"✗ Command sync error: {e}")
-    print(f"✓ Comet Bot online as {bot.user} ({bot.user.id})")
-    print(f"  Guild:      {GUILD_ID}")
-    print(f"  Changelog:  #{CHANGELOG_CHANNEL_ID}")
-    print(f"  Ticket cat: #{TICKET_CATEGORY_ID}")
+    await bot.tree.sync()
+    print(f"✅ UFF Bot online — {bot.user}")
+    print(f"   QBB Channel  : {QBB_CHANNEL_ID or 'not set'}")
+    print(f"   Owner ID     : {OWNER_ID}")
+    print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET — add UFF_THUMBNAIL_URL to Railway'}")
+    print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET — add UFF_BANNER_URL to Railway'}")
+
+    # Re-register persistent views so buttons survive bot restarts
+    # (Persistent views need timeout=None — handled separately below)
 
 
-@tree.error
-async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingRole):
+# ─────────────────────────────────────────────────────────────────────
+# /ranked_qbb
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="ranked_qbb", description="Challenge another player to a ranked UFF QBB")
+@app_commands.describe(
+    opponent="The player you want to challenge",
+    game_link="Roblox game link for this match",
+    your_team="Your team name",
+    opponent_team="Opponent's team name"
+)
+async def ranked_qbb(
+    interaction: discord.Interaction,
+    opponent: discord.Member,
+    game_link: str,
+    your_team: str,
+    opponent_team: str
+):
+    # ── Role check ───────────────────────────────────────────────────
+    user_role_ids = {role.id for role in interaction.user.roles}
+    if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
         await interaction.response.send_message(
-            "❌ You need the **Comet** role to use this command.", ephemeral=True)
+            "❌ You don't have the required role to start a ranked QBB.",
+            ephemeral=True
+        )
+        return
+
+    # ── Basic sanity checks ──────────────────────────────────────────
+    if opponent.id == interaction.user.id:
+        await interaction.response.send_message("❌ You can't challenge yourself!", ephemeral=True)
+        return
+    if opponent.bot:
+        await interaction.response.send_message("❌ Can't challenge a bot!", ephemeral=True)
+        return
+
+    # ── Cooldown check ───────────────────────────────────────────────
+    data = load_data()
+    cd, remaining = on_cooldown(data, interaction.user.id)
+    if cd:
+        e = discord.Embed(
+            title="⏳ Cooldown Active",
+            description=f"You can challenge again in **{remaining}**.\nCooldown: `{COOLDOWN_MINUTES} minutes`.",
+            color=0xE84040
+        )
+        e.set_footer(text=UFF_FOOTER)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+        return
+
+    # ── Update player records ────────────────────────────────────────
+    p1 = get_player(data, interaction.user.id)
+    p1["username"] = interaction.user.display_name
+    p2 = get_player(data, opponent.id)
+    p2["username"] = opponent.display_name
+
+    # ── Create pending match ─────────────────────────────────────────
+    match_id = f"{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
+    data.setdefault("pending", {})[match_id] = {
+        "challenger_id":   str(interaction.user.id),
+        "opponent_id":     str(opponent.id),
+        "challenger_name": interaction.user.display_name,
+        "opponent_name":   opponent.display_name,
+        "challenger_team": your_team,
+        "opponent_team":   opponent_team,
+        "game_link":       game_link,
+        "timestamp":       datetime.utcnow().isoformat(),
+        "match_id":        match_id,
+        "guild_id":        interaction.guild.id
+    }
+    save_data(data)
+
+    # ── Build DM challenge preview embed ────────────────────────────
+    e1, e2 = p1["elo"], p2["elo"]
+    r1, emoji1, _ = get_rank(e1)
+    r2, emoji2, _ = get_rank(e2)
+
+    dm_embed = discord.Embed(
+        title="🏈 You've Been Challenged to a QBB!",
+        description=(
+            f"**{interaction.user.display_name}** wants to play a ranked QBB against you.\n"
+            f"Accept or decline below. This request expires in **30 minutes**."
+        ),
+        color=UFF_COLOR
+    )
+
+    dm_embed.add_field(
+        name=f"🟡 {interaction.user.display_name}",
+        value=(
+            f"`{interaction.user.name}`\n"
+            f"**{your_team}**\n"
+            f"Rank: `{emoji1} {r1}`\n"
+            f"Tokens: 🪙 `{get_tokens(e1)}`"
+        ),
+        inline=True
+    )
+    dm_embed.add_field(name="\u200b", value="**— VS —**", inline=True)
+    dm_embed.add_field(
+        name=f"🔵 {opponent.display_name}",
+        value=(
+            f"`{opponent.name}`\n"
+            f"**{opponent_team}**\n"
+            f"Rank: `{emoji2} {r2}`\n"
+            f"Tokens: 🪙 `{get_tokens(e2)}`"
+        ),
+        inline=True
+    )
+    dm_embed.add_field(
+        name="🔗 Game Link",
+        value=f"[**Click here to join →**]({game_link})",
+        inline=False
+    )
+
+    if UFF_BANNER:
+        dm_embed.set_image(url=UFF_BANNER)
+    if UFF_THUMBNAIL:
+        dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
+    elif interaction.guild and interaction.guild.icon:
+        dm_embed.set_thumbnail(url=interaction.guild.icon.url)
+
+    dm_embed.set_footer(text=f"Challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
+    dm_embed.timestamp = datetime.utcnow()
+
+    # ── Build the Accept/Decline view ────────────────────────────────
+    view = QBBChallengeView(
+        match_id=match_id,
+        challenger_id=interaction.user.id,
+        opponent_id=opponent.id,
+        challenger_name=interaction.user.display_name,
+        opponent_name=opponent.display_name,
+        challenger_team=your_team,
+        opponent_team=opponent_team,
+        game_link=game_link,
+        guild_id=interaction.guild.id,
+    )
+
+    # ── DM the opponent ──────────────────────────────────────────────
+    try:
+        await opponent.send(embed=dm_embed, view=view)
+    except discord.Forbidden:
+        # Opponent has DMs closed
+        await interaction.response.send_message(
+            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.\n"
+            "Ask them to open their DMs and try again.",
+            ephemeral=True
+        )
+        # Clean up the pending match since it won't be acted on
+        if match_id in data.get("pending", {}):
+            del data["pending"][match_id]
+            save_data(data)
+        return
+
+    # ── Confirm to challenger (ephemeral — no public ping yet) ───────
+    confirm_embed = discord.Embed(
+        title="📨 Challenge Sent!",
+        description=(
+            f"Your QBB challenge has been sent to **{opponent.display_name}** via DM.\n\n"
+            f"The match will be posted publicly only **if they accept**.\n"
+            f"You'll get a DM either way."
+        ),
+        color=0x57F287
+    )
+    confirm_embed.set_footer(text=f"{UFF_FOOTER} • 30-minute response window")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /qbb_results
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="qbb_results", description="Submit QBB match results and scoreboard screenshot")
+@app_commands.describe(
+    winner="Who won?",
+    winner_score="Winner's score",
+    loser_score="Loser's score",
+    screenshot="Scoreboard screenshot"
+)
+async def qbb_results(
+    interaction: discord.Interaction,
+    winner: discord.Member,
+    winner_score: int,
+    loser_score: int,
+    screenshot: discord.Attachment
+):
+    data = load_data()
+    uid = str(interaction.user.id)
+
+    # Find most recent pending match for this user
+    pending = data.get("pending", {})
+    match, match_key = None, None
+    for key in sorted(pending, key=lambda k: pending[k].get("timestamp", ""), reverse=True):
+        m = pending[key]
+        if m["challenger_id"] == uid or m["opponent_id"] == uid:
+            match, match_key = m, key
+            break
+
+    if not match:
+        await interaction.response.send_message(
+            "❌ No pending QBB found. Use `/ranked_qbb` to start one first.",
+            ephemeral=True
+        )
+        return
+
+    c_id = int(match["challenger_id"])
+    o_id = int(match["opponent_id"])
+
+    if winner.id not in [c_id, o_id]:
+        await interaction.response.send_message(
+            "❌ Winner must be one of the two players in this match.",
+            ephemeral=True
+        )
+        return
+
+    loser_id   = o_id if winner.id == c_id else c_id
+    loser_name = match["opponent_name"] if winner.id == c_id else match["challenger_name"]
+
+    # Update ELO + records
+    wp = get_player(data, winner.id)
+    lp = get_player(data, loser_id)
+    wp["username"] = winner.display_name
+
+    old_w, old_l = wp["elo"], lp["elo"]
+    wp["elo"] += WIN_ELO
+    lp["elo"] = max(0, lp["elo"] - LOSS_ELO)
+    wp["wins"]   += 1
+    lp["losses"] += 1
+
+    now = datetime.utcnow().isoformat()
+    wp["last_game"] = now
+    lp["last_game"] = now
+
+    data.setdefault("matches", []).append({
+        "winner_id":       str(winner.id),
+        "winner_name":     winner.display_name,
+        "loser_id":        str(loser_id),
+        "loser_name":      loser_name,
+        "winner_score":    winner_score,
+        "loser_score":     loser_score,
+        "challenger_team": match["challenger_team"],
+        "opponent_team":   match["opponent_team"],
+        "date":            now
+    })
+
+    if match_key and match_key in data["pending"]:
+        del data["pending"][match_key]
+
+    save_data(data)
+
+    w_elo, l_elo   = wp["elo"], lp["elo"]
+    wr, we, wcolor = get_rank(w_elo)
+    lr, le, _      = get_rank(l_elo)
+
+    embed = discord.Embed(title="🏆 QBB Results", color=wcolor)
+
+    embed.add_field(
+        name="🏆 Winner",
+        value=(
+            f"<@{winner.id}> **{winner.display_name}**\n"
+            f"> Score: **{winner_score}**\n"
+            f"> ELO: `{old_w}` → `{w_elo}` **(+{WIN_ELO})**\n"
+            f"> Rank: `{we} {wr}`\n"
+            f"> Tokens: 🪙 `{get_tokens(w_elo)}`"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="❌ Loser",
+        value=(
+            f"<@{loser_id}> **{loser_name}**\n"
+            f"> Score: **{loser_score}**\n"
+            f"> ELO: `{old_l}` → `{l_elo}` **(-{LOSS_ELO})**\n"
+            f"> Rank: `{le} {lr}`\n"
+            f"> Tokens: 🪙 `{get_tokens(l_elo)}`"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="📊 Final Score",
+        value=f"**{winner.display_name}** `{winner_score} — {loser_score}` **{loser_name}**",
+        inline=False
+    )
+
+    embed.set_image(url=screenshot.url)
+
+    if UFF_THUMBNAIL:
+        embed.set_thumbnail(url=UFF_THUMBNAIL)
+    elif interaction.guild and interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+
+    embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}")
+    embed.timestamp = datetime.utcnow()
+
+    ch = await get_qbb_channel(interaction.guild)
+    if ch and ch.id != interaction.channel_id:
+        await interaction.response.send_message("✅ Results posted!", ephemeral=True)
+        await ch.send(embed=embed)
     else:
-        print(f"Command error: {error}")
-        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        await interaction.response.send_message(embed=embed)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# /qbb_profile
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="qbb_profile", description="View UFF QBB rank and stats")
+@app_commands.describe(player="Player to look up (leave blank for yourself)")
+async def qbb_profile(interaction: discord.Interaction, player: discord.Member = None):
+    target = player or interaction.user
+    data = load_data()
+    p = get_player(data, target.id)
+    elo = p["elo"]
+    rank, emoji, color = get_rank(elo)
+    gp = p["wins"] + p["losses"]
+    wr = f"{p['wins'] / gp * 100:.1f}%" if gp else "N/A"
+
+    embed = discord.Embed(title=f"{emoji} {target.display_name}", color=color)
+    embed.add_field(name="Rank",     value=f"`{emoji} {rank}`",        inline=True)
+    embed.add_field(name="ELO",      value=f"`{elo}`",                 inline=True)
+    embed.add_field(name="Tokens",   value=f"🪙 `{get_tokens(elo)}`",  inline=True)
+    embed.add_field(name="Wins",     value=f"`{p['wins']}`",           inline=True)
+    embed.add_field(name="Losses",   value=f"`{p['losses']}`",         inline=True)
+    embed.add_field(name="Win Rate", value=f"`{wr}`",                  inline=True)
+
+    if target.avatar:
+        embed.set_thumbnail(url=target.avatar.url)
+    embed.set_footer(text=UFF_FOOTER)
+    embed.timestamp = datetime.utcnow()
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /qbb_leaderboard
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="qbb_leaderboard", description="UFF QBB ELO leaderboard")
+async def qbb_leaderboard(interaction: discord.Interaction):
+    data = load_data()
+    players = data.get("players", {})
+    if not players:
+        await interaction.response.send_message("No players yet — play some QBBs!", ephemeral=True)
+        return
+
+    top = sorted(players.items(), key=lambda x: x[1]["elo"], reverse=True)[:15]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, p) in enumerate(top):
+        elo = p["elo"]
+        rank, emoji, _ = get_rank(elo)
+        medal = medals[i] if i < 3 else f"`{i + 1}.`"
+        name  = p.get("username") or f"<@{uid}>"
+        lines.append(
+            f"{medal} **{name}** — {emoji} `{rank}` | ELO `{elo}` | 🪙 `{get_tokens(elo)}` | {p['wins']}W {p['losses']}L"
+        )
+
+    embed = discord.Embed(
+        title="⚔️ UFF QBB — ELO Leaderboard",
+        description="\n".join(lines),
+        color=UFF_COLOR
+    )
+    apply_branding(embed)
+    embed.set_footer(text=UFF_FOOTER)
+    embed.timestamp = datetime.utcnow()
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /match_history
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="match_history", description="View recent UFF QBB results")
+async def match_history(interaction: discord.Interaction):
+    data = load_data()
+    matches = list(reversed(data.get("matches", [])))[:10]
+    if not matches:
+        await interaction.response.send_message("No matches recorded yet.", ephemeral=True)
+        return
+
+    lines = [
+        f"🏆 **{m['winner_name']}** `{m.get('winner_score', '?')}–{m.get('loser_score', '?')}` {m['loser_name']}"
+        for m in matches
+    ]
+    embed = discord.Embed(
+        title="📋 UFF QBB — Recent Results",
+        description="\n".join(lines),
+        color=0x4090E8
+    )
+    embed.set_footer(text=f"{UFF_FOOTER} • Last 10 matches")
+    embed.timestamp = datetime.utcnow()
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /teams
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="teams", description="View all 20 UFF league teams")
+async def teams_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="🏟️ United Flag Football — All Teams", color=UFF_COLOR)
+    embed.add_field(
+        name="Teams 1–10",
+        value="\n".join(f"`{t[1]}` **{t[0]}**" for t in TEAMS[:10]),
+        inline=True
+    )
+    embed.add_field(
+        name="Teams 11–20",
+        value="\n".join(f"`{t[1]}` **{t[0]}**" for t in TEAMS[10:]),
+        inline=True
+    )
+    apply_branding(embed)
+    embed.set_footer(text=f"{UFF_FOOTER} • 20 teams")
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /reset_player  — Admin only
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="reset_player", description="[Admin] Reset a player's ELO to 900")
+@app_commands.describe(player="Player to reset")
+@app_commands.default_permissions(administrator=True)
+async def reset_player(interaction: discord.Interaction, player: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+    data = load_data()
+    data["players"][str(player.id)] = {
+        "elo": STARTING_ELO, "wins": 0, "losses": 0,
+        "last_game": None, "username": player.display_name
+    }
+    save_data(data)
+    await interaction.response.send_message(
+        f"✅ Reset **{player.display_name}**'s ELO to `{STARTING_ELO}`.", ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /adjust_elo  — Admin only
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="adjust_elo", description="[Admin] Manually adjust a player's ELO")
+@app_commands.describe(player="Target player", amount="ELO to add (negative to subtract)")
+@app_commands.default_permissions(administrator=True)
+async def adjust_elo(interaction: discord.Interaction, player: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+    data = load_data()
+    p = get_player(data, player.id)
+    old = p["elo"]
+    p["elo"] = max(0, p["elo"] + amount)
+    p["username"] = player.display_name
+    save_data(data)
+    sign = "+" if amount >= 0 else ""
+    await interaction.response.send_message(
+        f"✅ **{player.display_name}** ELO: `{old}` → `{p['elo']}` ({sign}{amount})", ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /clear_cooldown  — Admin only
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="clear_cooldown", description="[Admin] Clear a player's 45-min cooldown")
+@app_commands.describe(player="Player to clear")
+@app_commands.default_permissions(administrator=True)
+async def clear_cooldown(interaction: discord.Interaction, player: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+    data = load_data()
+    get_player(data, player.id)["last_game"] = None
+    save_data(data)
+    await interaction.response.send_message(
+        f"✅ Cleared cooldown for **{player.display_name}**.", ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /help_uff
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="help_uff", description="UFF bot command guide")
+async def help_uff(interaction: discord.Interaction):
+    embed = discord.Embed(title="📖 United Flag Football — Commands", color=UFF_COLOR)
+    embed.add_field(name="⚔️ QBB", value=(
+        "`/ranked_qbb` — Challenge to a ranked QBB (sends opponent a DM to accept/decline)\n"
+        "`/qbb_results` — Submit results + screenshot after the game\n"
+        "`/qbb_profile` — Your ELO, rank & stats\n"
+        "`/qbb_leaderboard` — Top 15 ELO rankings\n"
+        "`/match_history` — Last 10 results"
+    ), inline=False)
+    embed.add_field(name="🏟️ League", value="`/teams` — View all 20 UFF teams", inline=False)
+    embed.add_field(name="🛡️ Admin", value=(
+        "`/reset_player` — Reset ELO to 900\n"
+        "`/adjust_elo` — Manually change ELO\n"
+        "`/clear_cooldown` — Remove 45-min cooldown"
+    ), inline=False)
+    embed.add_field(name="📊 Ranks", value=(
+        "**Start:** 900 ELO | **Win:** +100 | **Loss:** −100\n"
+        "⚙️ Iron I / II / III → 0 / 700 / 900 ELO\n"
+        "🥇 Gold I / II / III → 1,100 / 1,300 / 1,500 ELO\n"
+        "💎 Amethyst I / II / III → 1,700 / 1,900 / 2,100 ELO"
+    ), inline=False)
+    embed.add_field(name="ℹ️ How QBB Works", value=(
+        "1️⃣ Use `/ranked_qbb` to challenge someone\n"
+        "2️⃣ Opponent gets a **DM** with Accept / Decline buttons\n"
+        "3️⃣ If they accept → matchup posts publicly with @here\n"
+        "4️⃣ If they decline → challenger is notified, no public post\n"
+        "5️⃣ After the game, use `/qbb_results` to log the winner"
+    ), inline=False)
+    apply_branding(embed)
+    embed.set_footer(text=f"{UFF_FOOTER} • 45-min cooldown per game")
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not TOKEN:
-        print("ERROR: DISCORD_BOT_TOKEN env var not set")
-        exit(1)
     bot.run(TOKEN)
