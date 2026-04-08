@@ -193,7 +193,7 @@ def build_matchup_embed(
     r2, emoji2, _ = get_rank(e2)
 
     embed = discord.Embed(
-        title="🏈 Arena QBB Matchup",
+        title="🏈 QBB Matchup",
         color=UFF_COLOR
     )
 
@@ -337,8 +337,8 @@ class QBBChallengeView(discord.ui.View):
         )
 
         header = (
-            f"@here 🏟️ **LFG Arena Challenge — ACCEPTED**\n"
-            f"**{challenger.display_name}** vs **{opponent.display_name}** is going live!"
+            f"@here  **QBB**\n"
+            f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a qbb!"
         )
 
         # Post to QBB channel
