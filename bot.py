@@ -166,6 +166,12 @@ async def get_qbb_channel(guild: discord.Guild):
         ch = guild.get_channel(QBB_CHANNEL_ID)
         if ch:
             return ch
+        # FIX: fetch channel if not in cache
+        try:
+            ch = await guild.fetch_channel(QBB_CHANNEL_ID)
+            return ch
+        except (discord.NotFound, discord.Forbidden):
+            return None
     return None
 
 def build_matchup_embed(
@@ -296,18 +302,24 @@ class QBBChallengeView(discord.ui.View):
 
         data = load_data()
 
-        # Get guild and members
+        # Get guild
         guild = bot.get_guild(self.guild_id)
         if not guild:
             await interaction.response.send_message("❌ Could not find the server.", ephemeral=True)
             return
 
-        challenger = guild.get_member(self.challenger_id)
-        opponent   = guild.get_member(self.opponent_id)
-
-        if not challenger or not opponent:
+        # FIX: Use fetch_member as fallback so members not in cache are found
+        try:
+            challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
+            opponent   = guild.get_member(self.opponent_id)   or await guild.fetch_member(self.opponent_id)
+        except discord.NotFound:
             await interaction.response.send_message(
                 "❌ Could not find one of the players in the server.", ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ An error occurred while fetching players: {e}", ephemeral=True
             )
             return
 
@@ -334,7 +346,7 @@ class QBBChallengeView(discord.ui.View):
         if ch:
             await ch.send(content=header, embed=embed)
         else:
-            # Fallback: try to DM both players the embed
+            # Fallback: DM both players
             try:
                 await challenger.send(content="⚠️ QBB channel not set. Here's the matchup:", embed=embed)
             except discord.Forbidden:
@@ -406,8 +418,15 @@ class QBBChallengeView(discord.ui.View):
         await interaction.response.edit_message(embed=declined_embed, view=self)
 
         # DM the challenger
-        guild  = bot.get_guild(self.guild_id)
-        challenger = guild.get_member(self.challenger_id) if guild else None
+        guild = bot.get_guild(self.guild_id)
+        challenger = None
+        if guild:
+            # FIX: fetch_member fallback here too
+            try:
+                challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
         if challenger:
             try:
                 notify = discord.Embed(
@@ -429,6 +448,7 @@ class QBBChallengeView(discord.ui.View):
 # ─────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # FIX: needed so member cache stays populated
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -439,9 +459,6 @@ async def on_ready():
     print(f"   Owner ID     : {OWNER_ID}")
     print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET — add UFF_THUMBNAIL_URL to Railway'}")
     print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET — add UFF_BANNER_URL to Railway'}")
-
-    # Re-register persistent views so buttons survive bot restarts
-    # (Persistent views need timeout=None — handled separately below)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -581,19 +598,17 @@ async def ranked_qbb(
     try:
         await opponent.send(embed=dm_embed, view=view)
     except discord.Forbidden:
-        # Opponent has DMs closed
         await interaction.response.send_message(
             f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.\n"
             "Ask them to open their DMs and try again.",
             ephemeral=True
         )
-        # Clean up the pending match since it won't be acted on
         if match_id in data.get("pending", {}):
             del data["pending"][match_id]
             save_data(data)
         return
 
-    # ── Confirm to challenger (ephemeral — no public ping yet) ───────
+    # ── Confirm to challenger (ephemeral) ────────────────────────────
     confirm_embed = discord.Embed(
         title="📨 Challenge Sent!",
         description=(
