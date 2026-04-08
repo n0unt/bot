@@ -37,6 +37,8 @@ UFF_FOOTER   = "United Flag Football League"
 UFF_COLOR    = 0xF0C040   # gold
 CASUAL_COLOR = 0x5865F2   # blurple for casual
 
+GUILD_ID = 1262200419564785755  # UFF server — instant command sync
+
 # ─────────────────────────────────────────────────────────────────────
 # ELO CONFIG
 # ─────────────────────────────────────────────────────────────────────
@@ -111,7 +113,6 @@ def get_player(data, user_id: int):
     return data["players"][uid]
 
 def get_rank(elo: int):
-    """Returns (rank_name, emoji, embed_color)."""
     if elo >= 2100: return "Amethyst III", "💎", 0xA040E8
     if elo >= 1900: return "Amethyst II",  "💎", 0xA040E8
     if elo >= 1700: return "Amethyst I",   "💎", 0xA040E8
@@ -161,7 +162,6 @@ def build_matchup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, match_id, guild, data, accepted=False
 ):
-    """Build the ranked VS matchup embed."""
     p1 = get_player(data, challenger.id)
     p2 = get_player(data, opponent.id)
     e1, e2 = p1["elo"], p2["elo"]
@@ -193,14 +193,12 @@ def build_matchup_embed(
         value=f"[**Click here to join →**]({game_link})",
         inline=False
     )
-
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
         embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
     embed.set_footer(
         text=f"Challenge issued by {challenger.display_name} | {status} • /qbb_results when done"
@@ -213,7 +211,6 @@ def build_casual_matchup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, guild, accepted=False
 ):
-    """Build the casual VS matchup embed — no ELO."""
     embed = discord.Embed(title="Casual Matchup", color=CASUAL_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
@@ -231,14 +228,12 @@ def build_casual_matchup_embed(
         value=f"[**Click here to join →**]({game_link})",
         inline=False
     )
-
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
         embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
     embed.set_footer(
         text=f"Casual QBB issued by {challenger.display_name} | {status}"
@@ -248,17 +243,15 @@ def build_casual_matchup_embed(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SHARED CASUAL QBB LOGIC  (used by both /casual_qbb and /qbb_casual)
+# SHARED CASUAL LOGIC
 # ─────────────────────────────────────────────────────────────────────
 async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team):
-    """Core logic for a casual QBB challenge — called by both casual commands."""
     user_role_ids = {role.id for role in interaction.user.roles}
     if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
         await interaction.response.send_message(
             "❌ You don't have the required role to start a casual QBB.", ephemeral=True
         )
         return
-
     if opponent.id == interaction.user.id:
         await interaction.response.send_message("❌ You can't challenge yourself!", ephemeral=True)
         return
@@ -267,7 +260,6 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
         return
 
     data = load_data()
-
     match_id = f"casual_{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
     data.setdefault("casual_pending", {})[match_id] = {
         "challenger_id":   str(interaction.user.id),
@@ -304,14 +296,12 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
     )
     dm_embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
     dm_embed.add_field(name="\u200b", value="⚠️ This is **NOT** a ranked matchup — no ELO will be affected.", inline=False)
-
     if UFF_BANNER:
         dm_embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
         dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif interaction.guild and interaction.guild.icon:
         dm_embed.set_thumbnail(url=interaction.guild.icon.url)
-
     dm_embed.set_footer(text=f"Casual challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
     dm_embed.timestamp = datetime.utcnow()
 
@@ -331,8 +321,7 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
         await opponent.send(embed=dm_embed, view=view)
     except discord.Forbidden:
         await interaction.response.send_message(
-            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.\n"
-            "Ask them to open their DMs and try again.",
+            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.",
             ephemeral=True
         )
         if match_id in data.get("casual_pending", {}):
@@ -354,7 +343,7 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
 
 
 # ─────────────────────────────────────────────────────────────────────
-# RANKED ACCEPT / DECLINE BUTTON VIEW
+# RANKED ACCEPT / DECLINE VIEW
 # ─────────────────────────────────────────────────────────────────────
 class QBBChallengeView(discord.ui.View):
     def __init__(
@@ -388,7 +377,6 @@ class QBBChallengeView(discord.ui.View):
             return
         self.responded = True
         self.stop()
-
         for item in self.children:
             item.disabled = True
         await interaction.message.edit(view=self)
@@ -398,34 +386,26 @@ class QBBChallengeView(discord.ui.View):
         if not guild:
             await interaction.response.send_message("❌ Could not find the server.", ephemeral=True)
             return
-
         try:
             challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
             opponent   = guild.get_member(self.opponent_id)   or await guild.fetch_member(self.opponent_id)
         except discord.NotFound:
-            await interaction.response.send_message("❌ Could not find one of the players in the server.", ephemeral=True)
+            await interaction.response.send_message("❌ Could not find one of the players.", ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
             return
 
         embed = build_matchup_embed(
-            challenger=challenger,
-            opponent=opponent,
-            your_team=self.challenger_team,
-            opponent_team=self.opponent_team,
-            game_link=self.game_link,
-            match_id=self.match_id,
-            guild=guild,
-            data=data,
-            accepted=True
+            challenger=challenger, opponent=opponent,
+            your_team=self.challenger_team, opponent_team=self.opponent_team,
+            game_link=self.game_link, match_id=self.match_id,
+            guild=guild, data=data, accepted=True
         )
-
         header = (
             f"@here  **QBB**\n"
             f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a qbb!"
         )
-
         ch = await get_qbb_channel(guild)
         if ch:
             await ch.send(content=header, embed=embed)
@@ -473,7 +453,6 @@ class QBBChallengeView(discord.ui.View):
             return
         self.responded = True
         self.stop()
-
         for item in self.children:
             item.disabled = True
 
@@ -491,15 +470,9 @@ class QBBChallengeView(discord.ui.View):
         await interaction.response.edit_message(embed=declined_embed, view=self)
 
         guild = bot.get_guild(self.guild_id)
-        challenger = None
         if guild:
             try:
                 challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-        if challenger:
-            try:
                 notify = discord.Embed(
                     title="❌ Challenge Declined",
                     description=(
@@ -510,12 +483,12 @@ class QBBChallengeView(discord.ui.View):
                 )
                 notify.set_footer(text=UFF_FOOTER)
                 await challenger.send(embed=notify)
-            except discord.Forbidden:
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
                 pass
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CASUAL ACCEPT / DECLINE BUTTON VIEW
+# CASUAL ACCEPT / DECLINE VIEW
 # ─────────────────────────────────────────────────────────────────────
 class CasualQBBView(discord.ui.View):
     def __init__(
@@ -549,7 +522,6 @@ class CasualQBBView(discord.ui.View):
             return
         self.responded = True
         self.stop()
-
         for item in self.children:
             item.disabled = True
         await interaction.message.edit(view=self)
@@ -558,15 +530,14 @@ class CasualQBBView(discord.ui.View):
         if not guild:
             await interaction.response.send_message("❌ Could not find the server.", ephemeral=True)
             return
-
         try:
             challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
             opponent   = guild.get_member(self.opponent_id)   or await guild.fetch_member(self.opponent_id)
         except discord.NotFound:
-            await interaction.response.send_message("❌ Could not find one of the players in the server.", ephemeral=True)
+            await interaction.response.send_message("❌ Could not find one of the players.", ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
             return
 
         data = load_data()
@@ -575,20 +546,14 @@ class CasualQBBView(discord.ui.View):
             save_data(data)
 
         embed = build_casual_matchup_embed(
-            challenger=challenger,
-            opponent=opponent,
-            your_team=self.challenger_team,
-            opponent_team=self.opponent_team,
-            game_link=self.game_link,
-            guild=guild,
-            accepted=True
+            challenger=challenger, opponent=opponent,
+            your_team=self.challenger_team, opponent_team=self.opponent_team,
+            game_link=self.game_link, guild=guild, accepted=True
         )
-
         header = (
             f"@here  **Casual QBB**\n"
             f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a casual qbb!"
         )
-
         ch = await get_qbb_channel(guild)
         if ch:
             await ch.send(content=header, embed=embed)
@@ -635,7 +600,6 @@ class CasualQBBView(discord.ui.View):
             return
         self.responded = True
         self.stop()
-
         for item in self.children:
             item.disabled = True
 
@@ -653,15 +617,9 @@ class CasualQBBView(discord.ui.View):
         await interaction.response.edit_message(embed=declined_embed, view=self)
 
         guild = bot.get_guild(self.guild_id)
-        challenger = None
         if guild:
             try:
                 challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-        if challenger:
-            try:
                 notify = discord.Embed(
                     title="❌ Casual Challenge Declined",
                     description=(
@@ -672,7 +630,7 @@ class CasualQBBView(discord.ui.View):
                 )
                 notify.set_footer(text=UFF_FOOTER)
                 await challenger.send(embed=notify)
-            except discord.Forbidden:
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
                 pass
 
 
@@ -686,8 +644,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    # Sync to your specific guild instantly, then sync globally too
+    guild_obj = discord.Object(id=GUILD_ID)
+    bot.tree.copy_global_to(guild=guild_obj)
+    await bot.tree.sync(guild=guild_obj)
     await bot.tree.sync()
     print(f"✅ UFF Bot online — {bot.user}")
+    print(f"   Guild        : {GUILD_ID}")
     print(f"   QBB Channel  : {QBB_CHANNEL_ID or 'not set'}")
     print(f"   Owner ID     : {OWNER_ID}")
     print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET'}")
@@ -717,7 +680,6 @@ async def ranked_qbb(
             "❌ You don't have the required role to start a ranked QBB.", ephemeral=True
         )
         return
-
     if opponent.id == interaction.user.id:
         await interaction.response.send_message("❌ You can't challenge yourself!", ephemeral=True)
         return
@@ -789,14 +751,12 @@ async def ranked_qbb(
         inline=True
     )
     dm_embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
-
     if UFF_BANNER:
         dm_embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
         dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif interaction.guild and interaction.guild.icon:
         dm_embed.set_thumbnail(url=interaction.guild.icon.url)
-
     dm_embed.set_footer(text=f"Challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
     dm_embed.timestamp = datetime.utcnow()
 
@@ -859,7 +819,7 @@ async def casual_qbb(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_casual  — same as /casual_qbb, just an alternate name
+# /qbb_casual  — same as /casual_qbb, alternate name
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="qbb_casual", description="Challenge another player to a casual (unranked) QBB — no ELO changes")
 @app_commands.describe(
@@ -953,7 +913,6 @@ async def qbb_results(
 
     if match_key and match_key in data["pending"]:
         del data["pending"][match_key]
-
     save_data(data)
 
     w_elo, l_elo   = wp["elo"], lp["elo"]
@@ -987,12 +946,10 @@ async def qbb_results(
         inline=False
     )
     embed.set_image(url=screenshot.url)
-
     if UFF_THUMBNAIL:
         embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif interaction.guild and interaction.guild.icon:
         embed.set_thumbnail(url=interaction.guild.icon.url)
-
     embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}")
     embed.timestamp = datetime.utcnow()
 
@@ -1024,7 +981,6 @@ async def qbb_profile(interaction: discord.Interaction, player: discord.Member =
     embed.add_field(name="Wins",     value=f"`{p['wins']}`",    inline=True)
     embed.add_field(name="Losses",   value=f"`{p['losses']}`",  inline=True)
     embed.add_field(name="Win Rate", value=f"`{wr}`",           inline=True)
-
     if target.avatar:
         embed.set_thumbnail(url=target.avatar.url)
     embed.set_footer(text=UFF_FOOTER)
@@ -1051,15 +1007,9 @@ async def qbb_leaderboard(interaction: discord.Interaction):
         rank, emoji, _ = get_rank(elo)
         medal = medals[i] if i < 3 else f"`{i + 1}.`"
         name  = p.get("username") or f"<@{uid}>"
-        lines.append(
-            f"{medal} **{name}** — {emoji} `{rank}` | ELO `{elo}` | {p['wins']}W {p['losses']}L"
-        )
+        lines.append(f"{medal} **{name}** — {emoji} `{rank}` | ELO `{elo}` | {p['wins']}W {p['losses']}L")
 
-    embed = discord.Embed(
-        title="UFF — ELO Leaderboard",
-        description="\n".join(lines),
-        color=UFF_COLOR
-    )
+    embed = discord.Embed(title="UFF — ELO Leaderboard", description="\n".join(lines), color=UFF_COLOR)
     apply_branding(embed)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
@@ -1081,11 +1031,7 @@ async def match_history(interaction: discord.Interaction):
         f"🏆 **{m['winner_name']}** `{m.get('winner_score', '?')}–{m.get('loser_score', '?')}` {m['loser_name']}"
         for m in matches
     ]
-    embed = discord.Embed(
-        title="📋 UFF QBB — Recent Results",
-        description="\n".join(lines),
-        color=0x4090E8
-    )
+    embed = discord.Embed(title="📋 UFF QBB — Recent Results", description="\n".join(lines), color=0x4090E8)
     embed.set_footer(text=f"{UFF_FOOTER} • Last 10 matches")
     embed.timestamp = datetime.utcnow()
     await interaction.response.send_message(embed=embed)
