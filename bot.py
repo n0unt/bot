@@ -10,7 +10,7 @@ FLOW:
        Accept  → public matchup embed posts to QBB channel with @here ping
   4. /qbb_results → submit screenshot + winner → ELO updated, results embed posted
 
-  /casual_qbb → same flow as ranked but no ELO, just a matchup post
+  /casual_qbb or /qbb_casual → same flow as ranked but no ELO, just a matchup post
 """
 
 import discord
@@ -120,7 +120,7 @@ def get_rank(elo: int):
     if elo >= 1100: return "Gold I",       "🥇", 0xF0C040
     if elo >= 900:  return "Iron III",     "⚙️",  0x8090A0
     if elo >= 700:  return "Iron II",      "⚙️",  0x8090A0
-    return               "Iron I",        "⚙️",  0x8090A0
+    return                 "Iron I",       "⚙️",  0x8090A0
 
 def on_cooldown(data, user_id: int):
     p = get_player(data, user_id)
@@ -158,16 +158,9 @@ async def get_qbb_channel(guild: discord.Guild):
     return None
 
 def build_matchup_embed(
-    challenger: discord.Member,
-    opponent: discord.Member,
-    your_team: str,
-    opponent_team: str,
-    game_link: str,
-    match_id: str,
-    guild: discord.Guild,
-    data: dict,
-    accepted: bool = False
-) -> discord.Embed:
+    challenger, opponent, your_team, opponent_team,
+    game_link, match_id, guild, data, accepted=False
+):
     """Build the ranked VS matchup embed."""
     p1 = get_player(data, challenger.id)
     p2 = get_player(data, opponent.id)
@@ -217,14 +210,9 @@ def build_matchup_embed(
 
 
 def build_casual_matchup_embed(
-    challenger: discord.Member,
-    opponent: discord.Member,
-    your_team: str,
-    opponent_team: str,
-    game_link: str,
-    guild: discord.Guild,
-    accepted: bool = False
-) -> discord.Embed:
+    challenger, opponent, your_team, opponent_team,
+    game_link, guild, accepted=False
+):
     """Build the casual VS matchup embed — no ELO."""
     embed = discord.Embed(title="Casual Matchup", color=CASUAL_COLOR)
     embed.add_field(
@@ -260,20 +248,119 @@ def build_casual_matchup_embed(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# SHARED CASUAL QBB LOGIC  (used by both /casual_qbb and /qbb_casual)
+# ─────────────────────────────────────────────────────────────────────
+async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team):
+    """Core logic for a casual QBB challenge — called by both casual commands."""
+    user_role_ids = {role.id for role in interaction.user.roles}
+    if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ You don't have the required role to start a casual QBB.", ephemeral=True
+        )
+        return
+
+    if opponent.id == interaction.user.id:
+        await interaction.response.send_message("❌ You can't challenge yourself!", ephemeral=True)
+        return
+    if opponent.bot:
+        await interaction.response.send_message("❌ Can't challenge a bot!", ephemeral=True)
+        return
+
+    data = load_data()
+
+    match_id = f"casual_{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
+    data.setdefault("casual_pending", {})[match_id] = {
+        "challenger_id":   str(interaction.user.id),
+        "opponent_id":     str(opponent.id),
+        "challenger_name": interaction.user.display_name,
+        "opponent_name":   opponent.display_name,
+        "challenger_team": your_team,
+        "opponent_team":   opponent_team,
+        "game_link":       game_link,
+        "timestamp":       datetime.utcnow().isoformat(),
+        "match_id":        match_id,
+        "guild_id":        interaction.guild.id
+    }
+    save_data(data)
+
+    dm_embed = discord.Embed(
+        title="🏈 You've Been Challenged to a Casual QBB!",
+        description=(
+            f"**{interaction.user.display_name}** wants to play a casual (unranked) QBB against you.\n"
+            f"Accept or decline below. This request expires in **30 minutes**."
+        ),
+        color=CASUAL_COLOR
+    )
+    dm_embed.add_field(
+        name=f"🟡 {interaction.user.display_name}",
+        value=f"`{interaction.user.name}`\n**{your_team}**",
+        inline=True
+    )
+    dm_embed.add_field(name="\u200b", value="**— VS —**", inline=True)
+    dm_embed.add_field(
+        name=f"🔵 {opponent.display_name}",
+        value=f"`{opponent.name}`\n**{opponent_team}**",
+        inline=True
+    )
+    dm_embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
+    dm_embed.add_field(name="\u200b", value="⚠️ This is **NOT** a ranked matchup — no ELO will be affected.", inline=False)
+
+    if UFF_BANNER:
+        dm_embed.set_image(url=UFF_BANNER)
+    if UFF_THUMBNAIL:
+        dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
+    elif interaction.guild and interaction.guild.icon:
+        dm_embed.set_thumbnail(url=interaction.guild.icon.url)
+
+    dm_embed.set_footer(text=f"Casual challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
+    dm_embed.timestamp = datetime.utcnow()
+
+    view = CasualQBBView(
+        match_id=match_id,
+        challenger_id=interaction.user.id,
+        opponent_id=opponent.id,
+        challenger_name=interaction.user.display_name,
+        opponent_name=opponent.display_name,
+        challenger_team=your_team,
+        opponent_team=opponent_team,
+        game_link=game_link,
+        guild_id=interaction.guild.id,
+    )
+
+    try:
+        await opponent.send(embed=dm_embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.\n"
+            "Ask them to open their DMs and try again.",
+            ephemeral=True
+        )
+        if match_id in data.get("casual_pending", {}):
+            del data["casual_pending"][match_id]
+            save_data(data)
+        return
+
+    confirm_embed = discord.Embed(
+        title="📨 Casual Challenge Sent!",
+        description=(
+            f"Your casual QBB challenge has been sent to **{opponent.display_name}** via DM.\n\n"
+            f"The matchup will be posted publicly only **if they accept**.\n"
+            f"No ELO changes will occur."
+        ),
+        color=0x57F287
+    )
+    confirm_embed.set_footer(text=f"{UFF_FOOTER} • 30-minute response window")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # RANKED ACCEPT / DECLINE BUTTON VIEW
 # ─────────────────────────────────────────────────────────────────────
 class QBBChallengeView(discord.ui.View):
     def __init__(
-        self,
-        match_id: str,
-        challenger_id: int,
-        opponent_id: int,
-        challenger_name: str,
-        opponent_name: str,
-        challenger_team: str,
-        opponent_team: str,
-        game_link: str,
-        guild_id: int,
+        self, match_id, challenger_id, opponent_id,
+        challenger_name, opponent_name, challenger_team,
+        opponent_team, game_link, guild_id
     ):
         super().__init__(timeout=1800)
         self.match_id        = match_id
@@ -319,7 +406,7 @@ class QBBChallengeView(discord.ui.View):
             await interaction.response.send_message("❌ Could not find one of the players in the server.", ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.response.send_message(f"❌ An error occurred while fetching players: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
             return
 
         embed = build_matchup_embed(
@@ -432,16 +519,9 @@ class QBBChallengeView(discord.ui.View):
 # ─────────────────────────────────────────────────────────────────────
 class CasualQBBView(discord.ui.View):
     def __init__(
-        self,
-        match_id: str,
-        challenger_id: int,
-        opponent_id: int,
-        challenger_name: str,
-        opponent_name: str,
-        challenger_team: str,
-        opponent_team: str,
-        game_link: str,
-        guild_id: int,
+        self, match_id, challenger_id, opponent_id,
+        challenger_name, opponent_name, challenger_team,
+        opponent_team, game_link, guild_id
     ):
         super().__init__(timeout=1800)
         self.match_id        = match_id
@@ -486,7 +566,7 @@ class CasualQBBView(discord.ui.View):
             await interaction.response.send_message("❌ Could not find one of the players in the server.", ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.response.send_message(f"❌ An error occurred while fetching players: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
             return
 
         data = load_data()
@@ -610,8 +690,8 @@ async def on_ready():
     print(f"✅ UFF Bot online — {bot.user}")
     print(f"   QBB Channel  : {QBB_CHANNEL_ID or 'not set'}")
     print(f"   Owner ID     : {OWNER_ID}")
-    print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET — add UFF_THUMBNAIL_URL to Railway'}")
-    print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET — add UFF_BANNER_URL to Railway'}")
+    print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET'}")
+    print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET'}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -682,7 +762,7 @@ async def ranked_qbb(
     r2, emoji2, _ = get_rank(e2)
 
     dm_embed = discord.Embed(
-        title="🏈 You've Been challenged to a ranked QBB!",
+        title="🏈 You've Been Challenged to a Ranked QBB!",
         description=(
             f"**{interaction.user.display_name}** wants to play a ranked QBB against you.\n"
             f"Accept or decline below. This request expires in **30 minutes**."
@@ -775,105 +855,27 @@ async def casual_qbb(
     your_team: str,
     opponent_team: str
 ):
-    user_role_ids = {role.id for role in interaction.user.roles}
-    if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
-        await interaction.response.send_message(
-            "❌ You don't have the required role to start a casual QBB.", ephemeral=True
-        )
-        return
+    await _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team)
 
-    if opponent.id == interaction.user.id:
-        await interaction.response.send_message("❌ You can't challenge yourself!", ephemeral=True)
-        return
-    if opponent.bot:
-        await interaction.response.send_message("❌ Can't challenge a bot!", ephemeral=True)
-        return
 
-    data = load_data()
-
-    match_id = f"casual_{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
-    data.setdefault("casual_pending", {})[match_id] = {
-        "challenger_id":   str(interaction.user.id),
-        "opponent_id":     str(opponent.id),
-        "challenger_name": interaction.user.display_name,
-        "opponent_name":   opponent.display_name,
-        "challenger_team": your_team,
-        "opponent_team":   opponent_team,
-        "game_link":       game_link,
-        "timestamp":       datetime.utcnow().isoformat(),
-        "match_id":        match_id,
-        "guild_id":        interaction.guild.id
-    }
-    save_data(data)
-
-    dm_embed = discord.Embed(
-        title="🏈 You've Been challenged to a casual QBB!",
-        description=(
-            f"**{interaction.user.display_name}** wants to play a casual (unranked) QBB against you.\n"
-            f"Accept or decline below. This request expires in **30 minutes**."
-        ),
-        color=CASUAL_COLOR
-    )
-    dm_embed.add_field(
-        name=f"🟡 {interaction.user.display_name}",
-        value=f"`{interaction.user.name}`\n**{your_team}**",
-        inline=True
-    )
-    dm_embed.add_field(name="\u200b", value="**— VS —**", inline=True)
-    dm_embed.add_field(
-        name=f"🔵 {opponent.display_name}",
-        value=f"`{opponent.name}`\n**{opponent_team}**",
-        inline=True
-    )
-    dm_embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
-    dm_embed.add_field(name="\u200b", value="⚠️ This is **NOT** a ranked matchup — no ELO will be affected.", inline=False)
-
-    if UFF_BANNER:
-        dm_embed.set_image(url=UFF_BANNER)
-    if UFF_THUMBNAIL:
-        dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
-    elif interaction.guild and interaction.guild.icon:
-        dm_embed.set_thumbnail(url=interaction.guild.icon.url)
-
-    dm_embed.set_footer(text=f"Casual challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
-    dm_embed.timestamp = datetime.utcnow()
-
-    view = CasualQBBView(
-        match_id=match_id,
-        challenger_id=interaction.user.id,
-        opponent_id=opponent.id,
-        challenger_name=interaction.user.display_name,
-        opponent_name=opponent.display_name,
-        challenger_team=your_team,
-        opponent_team=opponent_team,
-        game_link=game_link,
-        guild_id=interaction.guild.id,
-    )
-
-    try:
-        await opponent.send(embed=dm_embed, view=view)
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.\n"
-            "Ask them to open their DMs and try again.",
-            ephemeral=True
-        )
-        if match_id in data.get("casual_pending", {}):
-            del data["casual_pending"][match_id]
-            save_data(data)
-        return
-
-    confirm_embed = discord.Embed(
-        title="📨 Casual Challenge Sent!",
-        description=(
-            f"Your casual QBB challenge has been sent to **{opponent.display_name}** via DM.\n\n"
-            f"The matchup will be posted publicly only **if they accept**.\n"
-            f"No ELO changes will occur."
-        ),
-        color=0x57F287
-    )
-    confirm_embed.set_footer(text=f"{UFF_FOOTER} • 30-minute response window")
-    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+# ─────────────────────────────────────────────────────────────────────
+# /qbb_casual  — same as /casual_qbb, just an alternate name
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="qbb_casual", description="Challenge another player to a casual (unranked) QBB — no ELO changes")
+@app_commands.describe(
+    opponent="The player you want to challenge",
+    game_link="Roblox game link for this match",
+    your_team="Your team name",
+    opponent_team="Opponent's team name"
+)
+async def qbb_casual(
+    interaction: discord.Interaction,
+    opponent: discord.Member,
+    game_link: str,
+    your_team: str,
+    opponent_team: str
+):
+    await _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1185,7 +1187,7 @@ async def help_uff(interaction: discord.Interaction):
         "`/match_history` — Last 10 results"
     ), inline=False)
     embed.add_field(name="🎮 Casual QBB", value=(
-        "`/casual_qbb` — Challenge to a casual QBB (no ELO changes, just for fun)"
+        "`/casual_qbb` or `/qbb_casual` — Casual QBB, no ELO changes"
     ), inline=False)
     embed.add_field(name="🏟️ League", value="`/teams` — View all 20 UFF teams", inline=False)
     embed.add_field(name="🛡️ Admin", value=(
@@ -1199,7 +1201,7 @@ async def help_uff(interaction: discord.Interaction):
         "🥇 Gold I / II / III → 1,100 / 1,300 / 1,500 ELO\n"
         "💎 Amethyst I / II / III → 1,700 / 1,900 / 2,100 ELO"
     ), inline=False)
-    embed.add_field(name="ℹ️ How QBB Works", value=(
+    embed.add_field(name="ℹ️ How It Works", value=(
         "1️⃣ Use `/ranked_qbb` or `/casual_qbb` to challenge someone\n"
         "2️⃣ Opponent gets a **DM** with Accept / Decline buttons\n"
         "3️⃣ If they accept → matchup posts publicly with @here\n"
