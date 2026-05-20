@@ -44,9 +44,9 @@ GUILD_ID = 1262200419564785755  # UFF server — instant command sync
 # ELO CONFIG
 # ─────────────────────────────────────────────────────────────────────
 STARTING_ELO     = 900
-WIN_ELO          = 50
-LOSS_ELO         = 50
-COOLDOWN_MINUTES = 40
+WIN_ELO          = 100
+LOSS_ELO         = 100
+COOLDOWN_MINUTES = 30
 
 # ─────────────────────────────────────────────────────────────────────
 # ROLES ALLOWED TO START A QBB
