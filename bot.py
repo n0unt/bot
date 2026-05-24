@@ -404,7 +404,7 @@ class QBBChallengeView(discord.ui.View):
             guild=guild, data=data, accepted=True
         )
         header = (
-            f"@here  **QBB**\n"
+            f"@everyone  **QBB**\n"
             f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a qbb!"
         )
         ch = await get_qbb_channel(guild)
@@ -661,14 +661,14 @@ async def on_ready():
 # ─────────────────────────────────────────────────────────────────────
 # /qbb_ranked
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="ranked_qbb", description="Challenge another player to a ranked UFF QBB")
+@bot.tree.command(name="qbb_ranked", description="Challenge another player to a ranked UFF QBB")
 @app_commands.describe(
     opponent="The player you want to challenge",
     game_link="Roblox game link for this match",
     your_team="Your team name",
     opponent_team="Opponent's team name"
 )
-async def ranked_qbb(
+async def qbb_ranked(
     interaction: discord.Interaction,
     opponent: discord.Member,
     game_link: str,
