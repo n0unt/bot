@@ -4,7 +4,7 @@ UFF Discord Bot — Python
 United Flag Football League — QBB Ranked System
 
 FLOW:
-  1. /ranked_qbb → challenger selects opponent + teams + game link
+  1. /qbb_ranked → challenger selects opponent + teams + game link
   2. Bot DMs the opponent with Accept / Decline buttons (NO public post yet)
   3. Opponent clicks:
        Decline → opponent DM updated, challenger gets a DM saying declined. Done.
