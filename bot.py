@@ -659,7 +659,7 @@ async def on_ready():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /ranked_qbb
+# /qbb_ranked
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="ranked_qbb", description="Challenge another player to a ranked UFF QBB")
 @app_commands.describe(
@@ -869,7 +869,7 @@ async def qbb_results(
 
     if not match:
         await interaction.response.send_message(
-            "❌ No pending ranked QBB found. Use `/ranked_qbb` to start one first.",
+            "❌ No pending ranked QBB found. Use `/qbb_ranked` to start one first.",
             ephemeral=True
         )
         return
@@ -1127,7 +1127,7 @@ async def clear_cooldown(interaction: discord.Interaction, player: discord.Membe
 async def help_uff(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 United Flag Football — Commands", color=UFF_COLOR)
     embed.add_field(name="⚔️ Ranked QBB", value=(
-        "`/ranked_qbb` — Challenge to a ranked QBB (ELO affected)\n"
+        "`/qbb_ranked` — Challenge to a ranked QBB (ELO affected)\n"
         "`/qbb_results` — Submit results + screenshot after the game\n"
         "`/qbb_profile` — Your ELO, rank & stats\n"
         "`/qbb_leaderboard` — Top 15 ELO rankings\n"
@@ -1149,7 +1149,7 @@ async def help_uff(interaction: discord.Interaction):
         "💎 Amethyst I / II / III → 1,700 / 1,900 / 2,100 ELO"
     ), inline=False)
     embed.add_field(name="ℹ️ How It Works", value=(
-        "1️⃣ Use `/ranked_qbb` or `/casual_qbb` to challenge someone\n"
+        "1️⃣ Use `/qbb_ranked` or `/casual_qbb` to challenge someone\n"
         "2️⃣ Opponent gets a **DM** with Accept / Decline buttons\n"
         "3️⃣ If they accept → matchup posts publicly with @here\n"
         "4️⃣ If they decline → challenger is notified, no public post\n"
