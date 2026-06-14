@@ -1,17 +1,20 @@
-
 """
 UFF Discord Bot — Python
-United Flag Football League — QBB Ranked System
+United Flag Football League — Pickup Ranked System
 
 FLOW:
-  1. /qbb_ranked → challenger selects opponent + teams + game link
+  1. /pickup_ranked → challenger selects opponent + teams + game link
   2. Bot DMs the opponent with Accept / Decline buttons (NO public post yet)
   3. Opponent clicks:
        Decline → opponent DM updated, challenger gets a DM saying declined. Done.
-       Accept  → public matchup embed posts to QBB channel with @here ping
-  4. /qbb_results → submit screenshot + winner → ELO updated, results embed posted
+       Accept  → public matchup embed posts to pickup channel with a ping
+  4. /pickup_results → submit screenshot + winner → ELO updated, results embed posted
 
-  /casual_qbb or /qbb_casual → same flow as ranked but no ELO, just a matchup post
+  /pickup_casual or /casual_pickup → same flow as ranked but no ELO, just a matchup post
+
+  /suspension → staff-only. Pick a player + up to 3 reasons (each adds a fixed
+  number of games), totals are summed, and a suspension notice posts to the
+  suspension channel.
 """
 
 import discord
@@ -27,8 +30,11 @@ from datetime import datetime, timedelta
 TOKEN          = os.getenv("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OWNER_ID       = int(os.getenv("OWNER_DISCORD_ID", "0"))
 SECRET_KEY     = os.getenv("SECRET_KEY", "")
-QBB_CHANNEL_ID = int(os.getenv("QBB_CHANNEL_ID", "0"))
+QBB_CHANNEL_ID = int(os.getenv("QBB_CHANNEL_ID", "0"))  # channel where pickup matchups post
 
+# Banner / logo images — set these in Railway, no code changes needed to swap art
+#   UFF_BANNER_URL    -> large image shown in the matchup embed (image)
+#   UFF_THUMBNAIL_URL -> small icon top-right of embeds (logo)
 UFF_THUMBNAIL  = os.getenv("UFF_THUMBNAIL_URL", "")
 UFF_BANNER     = os.getenv("UFF_BANNER_URL",    "")
 
@@ -49,15 +55,40 @@ LOSS_ELO         = 100
 COOLDOWN_MINUTES = 30
 
 # ─────────────────────────────────────────────────────────────────────
-# ROLES ALLOWED TO START A QBB
+# ROLES ALLOWED TO START A PICKUP
 # ─────────────────────────────────────────────────────────────────────
-QBB_ALLOWED_ROLE_IDS = {
+PICKUP_ALLOWED_ROLE_IDS = {
     1269693904815521994,  # QBB Captain
     1404271074623099040,  # Moderators
     1404271002241728617,  # League Boards
     1429344923865448550,  # Operations Director
     1262200419686285342,  # Commissioner
     1401450124424642561,  # Founder
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# SUSPENSIONS
+# ─────────────────────────────────────────────────────────────────────
+SUSPENSION_CHANNEL_ID = 1364423515532427264
+
+SUSPENSION_ALLOWED_USER_IDS = {
+    1414340980110528546,
+    1055321446978691112,
+}
+SUSPENSION_ALLOWED_ROLE_IDS = {
+    1513234210054344925,
+    1499141732108079225,
+}
+
+# key -> (display label, games)
+SUSPENSION_REASONS = {
+    "exploiting":             ("Exploiting",              24),
+    "dodging_screenshare":    ("Dodging Screenshare",      6),
+    "illegally_playing":      ("Illegally Playing",        2),
+    "possession_of_exploits": ("Possession of Exploits",  12),
+    "gameplay_manipulation":  ("Gameplay Manipulation",    8),
+    "alting":                 ("Alting",                  12),
+    "disbanding":             ("Disbanding",               4),
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -91,10 +122,11 @@ TEAMS = [
 # ─────────────────────────────────────────────────────────────────────
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"players": {}, "matches": [], "pending": {}, "casual_pending": {}}
+        return {"players": {}, "matches": [], "pending": {}, "casual_pending": {}, "suspensions": []}
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
     data.setdefault("casual_pending", {})
+    data.setdefault("suspensions", [])
     return data
 
 def save_data(data):
@@ -142,24 +174,38 @@ def is_admin(interaction: discord.Interaction) -> bool:
         or interaction.user.guild_permissions.administrator
     )
 
+def can_issue_suspension(interaction: discord.Interaction) -> bool:
+    if interaction.user.id in SUSPENSION_ALLOWED_USER_IDS:
+        return True
+    user_role_ids = {role.id for role in interaction.user.roles}
+    if user_role_ids & SUSPENSION_ALLOWED_ROLE_IDS:
+        return True
+    return is_admin(interaction)
+
 def apply_branding(embed: discord.Embed) -> discord.Embed:
     if UFF_THUMBNAIL:
         embed.set_thumbnail(url=UFF_THUMBNAIL)
     return embed
 
-async def get_qbb_channel(guild: discord.Guild):
-    if QBB_CHANNEL_ID:
-        ch = guild.get_channel(QBB_CHANNEL_ID)
-        if ch:
-            return ch
-        try:
-            ch = await guild.fetch_channel(QBB_CHANNEL_ID)
-            return ch
-        except (discord.NotFound, discord.Forbidden):
-            return None
-    return None
+async def get_channel_safe(guild: discord.Guild, channel_id: int):
+    if not channel_id:
+        return None
+    ch = guild.get_channel(channel_id)
+    if ch:
+        return ch
+    try:
+        return await guild.fetch_channel(channel_id)
+    except (discord.NotFound, discord.Forbidden):
+        return None
 
-def build_matchup_embed(
+async def get_pickup_channel(guild: discord.Guild):
+    return await get_channel_safe(guild, QBB_CHANNEL_ID)
+
+async def get_suspension_channel(guild: discord.Guild):
+    return await get_channel_safe(guild, SUSPENSION_CHANNEL_ID)
+
+
+def build_ranked_pickup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, match_id, guild, data, accepted=False
 ):
@@ -169,7 +215,7 @@ def build_matchup_embed(
     r1, emoji1, _ = get_rank(e1)
     r2, emoji2, _ = get_rank(e2)
 
-    embed = discord.Embed(title="Ranked Matchup", color=UFF_COLOR)
+    embed = discord.Embed(title="Ranked Pickup Matchup", color=UFF_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
         value=(
@@ -202,17 +248,17 @@ def build_matchup_embed(
         embed.set_thumbnail(url=guild.icon.url)
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
     embed.set_footer(
-        text=f"Challenge issued by {challenger.display_name} | {status} • /qbb_results when done"
+        text=f"Challenge issued by {challenger.display_name} | {status} • /pickup_results when done"
     )
     embed.timestamp = datetime.utcnow()
     return embed
 
 
-def build_casual_matchup_embed(
+def build_casual_pickup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, guild, accepted=False
 ):
-    embed = discord.Embed(title="Casual Matchup", color=CASUAL_COLOR)
+    embed = discord.Embed(title="Casual Pickup Matchup", color=CASUAL_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
         value=f"<@{challenger.id}>\n**{your_team}**",
@@ -237,7 +283,7 @@ def build_casual_matchup_embed(
         embed.set_thumbnail(url=guild.icon.url)
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
     embed.set_footer(
-        text=f"Casual QBB issued by {challenger.display_name} | {status}"
+        text=f"Casual pickup issued by {challenger.display_name} | {status}"
     )
     embed.timestamp = datetime.utcnow()
     return embed
@@ -246,11 +292,11 @@ def build_casual_matchup_embed(
 # ─────────────────────────────────────────────────────────────────────
 # SHARED CASUAL LOGIC
 # ─────────────────────────────────────────────────────────────────────
-async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team):
+async def _run_casual_pickup(interaction, opponent, game_link, your_team, opponent_team):
     user_role_ids = {role.id for role in interaction.user.roles}
-    if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
+    if not (user_role_ids & PICKUP_ALLOWED_ROLE_IDS) and not is_admin(interaction):
         await interaction.response.send_message(
-            "❌ You don't have the required role to start a casual QBB.", ephemeral=True
+            "❌ You don't have the required role to start a casual pickup.", ephemeral=True
         )
         return
     if opponent.id == interaction.user.id:
@@ -277,9 +323,9 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
     save_data(data)
 
     dm_embed = discord.Embed(
-        title="🏈 You've Been Challenged to a Casual QBB!",
+        title="🏈 You've Been Challenged to a Casual Pickup!",
         description=(
-            f"**{interaction.user.display_name}** wants to play a casual (unranked) QBB against you.\n"
+            f"**{interaction.user.display_name}** wants to play a casual (unranked) pickup against you.\n"
             f"Accept or decline below. This request expires in **30 minutes**."
         ),
         color=CASUAL_COLOR
@@ -303,10 +349,10 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
         dm_embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif interaction.guild and interaction.guild.icon:
         dm_embed.set_thumbnail(url=interaction.guild.icon.url)
-    dm_embed.set_footer(text=f"Casual challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
+    dm_embed.set_footer(text=f"Casual pickup challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
     dm_embed.timestamp = datetime.utcnow()
 
-    view = CasualQBBView(
+    view = CasualPickupView(
         match_id=match_id,
         challenger_id=interaction.user.id,
         opponent_id=opponent.id,
@@ -331,9 +377,9 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
         return
 
     confirm_embed = discord.Embed(
-        title="📨 Casual Challenge Sent!",
+        title="📨 Casual Pickup Sent!",
         description=(
-            f"Your casual QBB challenge has been sent to **{opponent.display_name}** via DM.\n\n"
+            f"Your casual pickup challenge has been sent to **{opponent.display_name}** via DM.\n\n"
             f"The matchup will be posted publicly only **if they accept**.\n"
             f"No ELO changes will occur."
         ),
@@ -344,9 +390,9 @@ async def _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_
 
 
 # ─────────────────────────────────────────────────────────────────────
-# RANKED ACCEPT / DECLINE VIEW
+# RANKED PICKUP — ACCEPT / DECLINE VIEW
 # ─────────────────────────────────────────────────────────────────────
-class QBBChallengeView(discord.ui.View):
+class RankedPickupView(discord.ui.View):
     def __init__(
         self, match_id, challenger_id, opponent_id,
         challenger_name, opponent_name, challenger_team,
@@ -397,22 +443,22 @@ class QBBChallengeView(discord.ui.View):
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
             return
 
-        embed = build_matchup_embed(
+        embed = build_ranked_pickup_embed(
             challenger=challenger, opponent=opponent,
             your_team=self.challenger_team, opponent_team=self.opponent_team,
             game_link=self.game_link, match_id=self.match_id,
             guild=guild, data=data, accepted=True
         )
         header = (
-            f"@everyone  **QBB**\n"
-            f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a qbb!"
+            f"@everyone  **Ranked Pickup**\n"
+            f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a ranked pickup!"
         )
-        ch = await get_qbb_channel(guild)
+        ch = await get_pickup_channel(guild)
         if ch:
             await ch.send(content=header, embed=embed)
         else:
             try:
-                await challenger.send(content="⚠️ QBB channel not set. Here's the matchup:", embed=embed)
+                await challenger.send(content="⚠️ Pickup channel not set. Here's the matchup:", embed=embed)
             except discord.Forbidden:
                 pass
 
@@ -420,7 +466,7 @@ class QBBChallengeView(discord.ui.View):
             title="✅ Challenge Accepted!",
             description=(
                 f"You accepted **{self.challenger_name}**'s challenge!\n\n"
-                f"The matchup has been posted to the QBB channel.\n"
+                f"The matchup has been posted to the pickup channel.\n"
                 f"🔗 [Join the game]({self.game_link})"
             ),
             color=0x57F287
@@ -432,10 +478,10 @@ class QBBChallengeView(discord.ui.View):
             notify = discord.Embed(
                 title="✅ Challenge Accepted!",
                 description=(
-                    f"**{self.opponent_name}** accepted your QBB challenge!\n\n"
-                    f"The matchup has been posted to the QBB channel.\n"
+                    f"**{self.opponent_name}** accepted your pickup challenge!\n\n"
+                    f"The matchup has been posted to the pickup channel.\n"
                     f"🔗 [Join the game]({self.game_link})\n\n"
-                    f"Use `/qbb_results` when the game is over."
+                    f"Use `/pickup_results` when the game is over."
                 ),
                 color=0x57F287
             )
@@ -464,7 +510,7 @@ class QBBChallengeView(discord.ui.View):
 
         declined_embed = discord.Embed(
             title="❌ Challenge Declined",
-            description=f"You declined **{self.challenger_name}**'s QBB challenge.",
+            description=f"You declined **{self.challenger_name}**'s pickup challenge.",
             color=0xED4245
         )
         declined_embed.set_footer(text=UFF_FOOTER)
@@ -477,7 +523,7 @@ class QBBChallengeView(discord.ui.View):
                 notify = discord.Embed(
                     title="❌ Challenge Declined",
                     description=(
-                        f"**{self.opponent_name}** declined your QBB challenge.\n"
+                        f"**{self.opponent_name}** declined your pickup challenge.\n"
                         f"No match was recorded. You're free to challenge someone else!"
                     ),
                     color=0xED4245
@@ -489,9 +535,9 @@ class QBBChallengeView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CASUAL ACCEPT / DECLINE VIEW
+# CASUAL PICKUP — ACCEPT / DECLINE VIEW
 # ─────────────────────────────────────────────────────────────────────
-class CasualQBBView(discord.ui.View):
+class CasualPickupView(discord.ui.View):
     def __init__(
         self, match_id, challenger_id, opponent_id,
         challenger_name, opponent_name, challenger_team,
@@ -546,29 +592,29 @@ class CasualQBBView(discord.ui.View):
             del data["casual_pending"][self.match_id]
             save_data(data)
 
-        embed = build_casual_matchup_embed(
+        embed = build_casual_pickup_embed(
             challenger=challenger, opponent=opponent,
             your_team=self.challenger_team, opponent_team=self.opponent_team,
             game_link=self.game_link, guild=guild, accepted=True
         )
         header = (
-            f"@here  **Casual QBB**\n"
-            f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a casual qbb!"
+            f"@here  **Casual Pickup**\n"
+            f"**{challenger.display_name}** vs **{opponent.display_name}** is hosting a casual pickup!"
         )
-        ch = await get_qbb_channel(guild)
+        ch = await get_pickup_channel(guild)
         if ch:
             await ch.send(content=header, embed=embed)
         else:
             try:
-                await challenger.send(content="⚠️ QBB channel not set. Here's the matchup:", embed=embed)
+                await challenger.send(content="⚠️ Pickup channel not set. Here's the matchup:", embed=embed)
             except discord.Forbidden:
                 pass
 
         accepted_embed = discord.Embed(
-            title="✅ Casual Challenge Accepted!",
+            title="✅ Challenge Accepted!",
             description=(
-                f"You accepted **{self.challenger_name}**'s casual QBB!\n\n"
-                f"The matchup has been posted to the QBB channel.\n"
+                f"You accepted **{self.challenger_name}**'s casual pickup!\n\n"
+                f"The matchup has been posted to the pickup channel.\n"
                 f"🔗 [Join the game]({self.game_link})"
             ),
             color=0x57F287
@@ -578,10 +624,10 @@ class CasualQBBView(discord.ui.View):
 
         try:
             notify = discord.Embed(
-                title="✅ Casual Challenge Accepted!",
+                title="✅ Challenge Accepted!",
                 description=(
-                    f"**{self.opponent_name}** accepted your casual QBB!\n\n"
-                    f"The matchup has been posted to the QBB channel.\n"
+                    f"**{self.opponent_name}** accepted your casual pickup!\n\n"
+                    f"The matchup has been posted to the pickup channel.\n"
                     f"🔗 [Join the game]({self.game_link})"
                 ),
                 color=0x57F287
@@ -610,8 +656,8 @@ class CasualQBBView(discord.ui.View):
             save_data(data)
 
         declined_embed = discord.Embed(
-            title="❌ Casual Challenge Declined",
-            description=f"You declined **{self.challenger_name}**'s casual QBB.",
+            title="❌ Challenge Declined",
+            description=f"You declined **{self.challenger_name}**'s casual pickup.",
             color=0xED4245
         )
         declined_embed.set_footer(text=UFF_FOOTER)
@@ -622,9 +668,9 @@ class CasualQBBView(discord.ui.View):
             try:
                 challenger = guild.get_member(self.challenger_id) or await guild.fetch_member(self.challenger_id)
                 notify = discord.Embed(
-                    title="❌ Casual Challenge Declined",
+                    title="❌ Challenge Declined",
                     description=(
-                        f"**{self.opponent_name}** declined your casual QBB.\n"
+                        f"**{self.opponent_name}** declined your casual pickup.\n"
                         f"You're free to challenge someone else!"
                     ),
                     color=0xED4245
@@ -633,6 +679,138 @@ class CasualQBBView(discord.ui.View):
                 await challenger.send(embed=notify)
             except (discord.NotFound, discord.HTTPException, discord.Forbidden):
                 pass
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SUSPENSION UI
+# ─────────────────────────────────────────────────────────────────────
+class SuspensionReasonSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=f"{label} — {games} games",
+                value=key,
+                description=f"Adds {games} games to the suspension total"
+            )
+            for key, (label, games) in SUSPENSION_REASONS.items()
+        ]
+        super().__init__(
+            placeholder="Select up to 3 reasons...",
+            min_values=1,
+            max_values=3,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SuspensionView = self.view
+        view.selected_reasons = self.values
+
+        total_games = sum(SUSPENSION_REASONS[r][1] for r in view.selected_reasons)
+        reason_lines = "\n".join(
+            f"• **{SUSPENSION_REASONS[r][0]}** — {SUSPENSION_REASONS[r][1]} games"
+            for r in view.selected_reasons
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                f"**Suspension preview — {view.target.display_name}**\n\n"
+                f"{reason_lines}\n\n"
+                f"**Total: {total_games} games**\n\n"
+                f"Click **Confirm & Post** to publish this suspension, or change your selection above."
+            ),
+            view=view
+        )
+
+
+class SuspensionConfirmButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ Confirm & Post", style=discord.ButtonStyle.success, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SuspensionView = self.view
+
+        if not view.selected_reasons:
+            await interaction.response.send_message(
+                "❌ Select at least one reason before confirming.", ephemeral=True
+            )
+            return
+
+        total_games = sum(SUSPENSION_REASONS[r][1] for r in view.selected_reasons)
+        reason_lines = "\n".join(
+            f"• **{SUSPENSION_REASONS[r][0]}** — {SUSPENSION_REASONS[r][1]} games"
+            for r in view.selected_reasons
+        )
+
+        embed = discord.Embed(title="🚫 Player Suspension", color=0xED4245)
+        embed.add_field(name="Player", value=f"<@{view.target.id}> ({view.target.display_name})", inline=False)
+        embed.add_field(name="Reason(s)", value=reason_lines, inline=False)
+        embed.add_field(name="Total Games Suspended", value=f"**{total_games} games**", inline=False)
+        if view.target.avatar:
+            embed.set_thumbnail(url=view.target.avatar.url)
+        embed.set_footer(text=f"Issued by {interaction.user.display_name} | {UFF_FOOTER}")
+        embed.timestamp = datetime.utcnow()
+
+        ch = await get_suspension_channel(interaction.guild)
+
+        for item in view.children:
+            item.disabled = True
+
+        if ch:
+            await ch.send(embed=embed)
+            await interaction.response.edit_message(
+                content=f"✅ Suspension posted to {ch.mention}.", view=view
+            )
+            data = load_data()
+            data.setdefault("suspensions", []).append({
+                "player_id":   str(view.target.id),
+                "player_name": view.target.display_name,
+                "reasons":     [SUSPENSION_REASONS[r][0] for r in view.selected_reasons],
+                "total_games": total_games,
+                "issued_by":   str(interaction.user.id),
+                "issued_by_name": interaction.user.display_name,
+                "date":        datetime.utcnow().isoformat(),
+            })
+            save_data(data)
+        else:
+            await interaction.response.edit_message(
+                content="❌ Could not find the suspension channel. Check `SUSPENSION_CHANNEL_ID`.",
+                view=view
+            )
+
+
+class SuspensionCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SuspensionView = self.view
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Suspension cancelled — nothing was posted.", view=view)
+        view.stop()
+
+
+class SuspensionView(discord.ui.View):
+    def __init__(self, target: discord.Member, issuer_id: int):
+        super().__init__(timeout=300)
+        self.target = target
+        self.issuer_id = issuer_id
+        self.selected_reasons = []
+        self.add_item(SuspensionReasonSelect())
+        self.add_item(SuspensionConfirmButton())
+        self.add_item(SuspensionCancelButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.issuer_id:
+            await interaction.response.send_message(
+                "❌ Only the staff member who started this can use these controls.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -645,30 +823,30 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # Sync to your specific guild instantly, then sync globally too
     guild_obj = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild_obj)
     await bot.tree.sync(guild=guild_obj)
     await bot.tree.sync()
     print(f"✅ UFF Bot online — {bot.user}")
     print(f"   Guild        : {GUILD_ID}")
-    print(f"   QBB Channel  : {QBB_CHANNEL_ID or 'not set'}")
+    print(f"   Pickup Channel    : {QBB_CHANNEL_ID or 'not set'}")
+    print(f"   Suspension Channel: {SUSPENSION_CHANNEL_ID or 'not set'}")
     print(f"   Owner ID     : {OWNER_ID}")
     print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET'}")
     print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET'}")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_ranked
+# /pickup_ranked
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="qbb_ranked", description="Challenge another player to a ranked UFF QBB")
+@bot.tree.command(name="pickup_ranked", description="Challenge another player to a ranked UFF pickup")
 @app_commands.describe(
     opponent="The player you want to challenge",
     game_link="Roblox game link for this match",
     your_team="Your team name",
     opponent_team="Opponent's team name"
 )
-async def qbb_ranked(
+async def pickup_ranked(
     interaction: discord.Interaction,
     opponent: discord.Member,
     game_link: str,
@@ -676,9 +854,9 @@ async def qbb_ranked(
     opponent_team: str
 ):
     user_role_ids = {role.id for role in interaction.user.roles}
-    if not (user_role_ids & QBB_ALLOWED_ROLE_IDS) and not is_admin(interaction):
+    if not (user_role_ids & PICKUP_ALLOWED_ROLE_IDS) and not is_admin(interaction):
         await interaction.response.send_message(
-            "❌ You don't have the required role to start a ranked QBB.", ephemeral=True
+            "❌ You don't have the required role to start a ranked pickup.", ephemeral=True
         )
         return
     if opponent.id == interaction.user.id:
@@ -725,9 +903,9 @@ async def qbb_ranked(
     r2, emoji2, _ = get_rank(e2)
 
     dm_embed = discord.Embed(
-        title="🏈 You've Been Challenged to a Ranked QBB!",
+        title="🏈 You've Been Challenged to a Ranked Pickup!",
         description=(
-            f"**{interaction.user.display_name}** wants to play a ranked QBB against you.\n"
+            f"**{interaction.user.display_name}** wants to play a ranked pickup against you.\n"
             f"Accept or decline below. This request expires in **30 minutes**."
         ),
         color=UFF_COLOR
@@ -761,7 +939,7 @@ async def qbb_ranked(
     dm_embed.set_footer(text=f"Challenge issued by {interaction.user.display_name} | {UFF_FOOTER}")
     dm_embed.timestamp = datetime.utcnow()
 
-    view = QBBChallengeView(
+    view = RankedPickupView(
         match_id=match_id,
         challenger_id=interaction.user.id,
         opponent_id=opponent.id,
@@ -789,7 +967,7 @@ async def qbb_ranked(
     confirm_embed = discord.Embed(
         title="📨 Challenge Sent!",
         description=(
-            f"Your QBB challenge has been sent to **{opponent.display_name}** via DM.\n\n"
+            f"Your ranked pickup challenge has been sent to **{opponent.display_name}** via DM.\n\n"
             f"The match will be posted publicly only **if they accept**.\n"
             f"You'll get a DM either way."
         ),
@@ -800,56 +978,56 @@ async def qbb_ranked(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /casual_qbb
+# /pickup_casual
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="casual_qbb", description="Challenge another player to a casual (unranked) QBB — no ELO changes")
+@bot.tree.command(name="pickup_casual", description="Challenge another player to a casual (unranked) pickup — no ELO changes")
 @app_commands.describe(
     opponent="The player you want to challenge",
     game_link="Roblox game link for this match",
     your_team="Your team name",
     opponent_team="Opponent's team name"
 )
-async def casual_qbb(
+async def pickup_casual(
     interaction: discord.Interaction,
     opponent: discord.Member,
     game_link: str,
     your_team: str,
     opponent_team: str
 ):
-    await _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team)
+    await _run_casual_pickup(interaction, opponent, game_link, your_team, opponent_team)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_casual  — same as /casual_qbb, alternate name
+# /casual_pickup  — same as /pickup_casual, alternate name
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="qbb_casual", description="Challenge another player to a casual (unranked) QBB — no ELO changes")
+@bot.tree.command(name="casual_pickup", description="Challenge another player to a casual (unranked) pickup — no ELO changes")
 @app_commands.describe(
     opponent="The player you want to challenge",
     game_link="Roblox game link for this match",
     your_team="Your team name",
     opponent_team="Opponent's team name"
 )
-async def qbb_casual(
+async def casual_pickup(
     interaction: discord.Interaction,
     opponent: discord.Member,
     game_link: str,
     your_team: str,
     opponent_team: str
 ):
-    await _run_casual_qbb(interaction, opponent, game_link, your_team, opponent_team)
+    await _run_casual_pickup(interaction, opponent, game_link, your_team, opponent_team)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_results
+# /pickup_results
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="qbb_results", description="Submit ranked QBB match results and scoreboard screenshot")
+@bot.tree.command(name="pickup_results", description="Submit ranked pickup match results and scoreboard screenshot")
 @app_commands.describe(
     winner="Who won?",
     winner_score="Winner's score",
     loser_score="Loser's score",
     screenshot="Scoreboard screenshot"
 )
-async def qbb_results(
+async def pickup_results(
     interaction: discord.Interaction,
     winner: discord.Member,
     winner_score: int,
@@ -869,7 +1047,7 @@ async def qbb_results(
 
     if not match:
         await interaction.response.send_message(
-            "❌ No pending ranked QBB found. Use `/qbb_ranked` to start one first.",
+            "❌ No pending ranked pickup found. Use `/pickup_ranked` to start one first.",
             ephemeral=True
         )
         return
@@ -920,7 +1098,7 @@ async def qbb_results(
     wr, we, wcolor = get_rank(w_elo)
     lr, le, _      = get_rank(l_elo)
 
-    embed = discord.Embed(title="🏆 QBB Results", color=wcolor)
+    embed = discord.Embed(title="🏆 Pickup Results", color=wcolor)
     embed.add_field(
         name="🏆 Winner",
         value=(
@@ -954,7 +1132,7 @@ async def qbb_results(
     embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}")
     embed.timestamp = datetime.utcnow()
 
-    ch = await get_qbb_channel(interaction.guild)
+    ch = await get_pickup_channel(interaction.guild)
     if ch and ch.id != interaction.channel_id:
         await interaction.response.send_message("✅ Results posted!", ephemeral=True)
         await ch.send(embed=embed)
@@ -963,11 +1141,11 @@ async def qbb_results(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_profile
+# /pickup_profile
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="qbb_profile", description="View UFF QBB rank and stats")
+@bot.tree.command(name="pickup_profile", description="View UFF pickup rank and stats")
 @app_commands.describe(player="Player to look up (leave blank for yourself)")
-async def qbb_profile(interaction: discord.Interaction, player: discord.Member = None):
+async def pickup_profile(interaction: discord.Interaction, player: discord.Member = None):
     target = player or interaction.user
     data = load_data()
     p = get_player(data, target.id)
@@ -990,14 +1168,14 @@ async def qbb_profile(interaction: discord.Interaction, player: discord.Member =
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /qbb_leaderboard
+# /pickup_leaderboard
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="qbb_leaderboard", description="UFF QBB ELO leaderboard")
-async def qbb_leaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="pickup_leaderboard", description="UFF pickup ELO leaderboard")
+async def pickup_leaderboard(interaction: discord.Interaction):
     data = load_data()
     players = data.get("players", {})
     if not players:
-        await interaction.response.send_message("No players yet — play some QBBs!", ephemeral=True)
+        await interaction.response.send_message("No players yet — play some pickups!", ephemeral=True)
         return
 
     top = sorted(players.items(), key=lambda x: x[1]["elo"], reverse=True)[:15]
@@ -1010,7 +1188,7 @@ async def qbb_leaderboard(interaction: discord.Interaction):
         name  = p.get("username") or f"<@{uid}>"
         lines.append(f"{medal} **{name}** — {emoji} `{rank}` | ELO `{elo}` | {p['wins']}W {p['losses']}L")
 
-    embed = discord.Embed(title="UFF — ELO Leaderboard", description="\n".join(lines), color=UFF_COLOR)
+    embed = discord.Embed(title="UFF Pickup — ELO Leaderboard", description="\n".join(lines), color=UFF_COLOR)
     apply_branding(embed)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
@@ -1020,7 +1198,7 @@ async def qbb_leaderboard(interaction: discord.Interaction):
 # ─────────────────────────────────────────────────────────────────────
 # /match_history
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="match_history", description="View recent UFF QBB results")
+@bot.tree.command(name="match_history", description="View recent UFF pickup results")
 async def match_history(interaction: discord.Interaction):
     data = load_data()
     matches = list(reversed(data.get("matches", [])))[:10]
@@ -1032,7 +1210,7 @@ async def match_history(interaction: discord.Interaction):
         f"🏆 **{m['winner_name']}** `{m.get('winner_score', '?')}–{m.get('loser_score', '?')}` {m['loser_name']}"
         for m in matches
     ]
-    embed = discord.Embed(title="📋 UFF QBB — Recent Results", description="\n".join(lines), color=0x4090E8)
+    embed = discord.Embed(title="📋 UFF Pickup — Recent Results", description="\n".join(lines), color=0x4090E8)
     embed.set_footer(text=f"{UFF_FOOTER} • Last 10 matches")
     embed.timestamp = datetime.utcnow()
     await interaction.response.send_message(embed=embed)
@@ -1121,20 +1299,43 @@ async def clear_cooldown(interaction: discord.Interaction, player: discord.Membe
 
 
 # ─────────────────────────────────────────────────────────────────────
+# /suspension  — Staff only
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="suspension", description="[Staff] Issue a suspension to a player")
+@app_commands.describe(player="The player to suspend")
+async def suspension(interaction: discord.Interaction, player: discord.Member):
+    if not can_issue_suspension(interaction):
+        await interaction.response.send_message(
+            "❌ You don't have permission to issue suspensions.", ephemeral=True
+        )
+        return
+
+    view = SuspensionView(target=player, issuer_id=interaction.user.id)
+    await interaction.response.send_message(
+        content=(
+            f"**Issuing suspension for {player.display_name}**\n"
+            f"Select up to 3 reasons below. Games stack and total automatically."
+        ),
+        view=view,
+        ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
 # /help_uff
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="help_uff", description="UFF bot command guide")
 async def help_uff(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 United Flag Football — Commands", color=UFF_COLOR)
-    embed.add_field(name="⚔️ Ranked QBB", value=(
-        "`/qbb_ranked` — Challenge to a ranked QBB (ELO affected)\n"
-        "`/qbb_results` — Submit results + screenshot after the game\n"
-        "`/qbb_profile` — Your ELO, rank & stats\n"
-        "`/qbb_leaderboard` — Top 15 ELO rankings\n"
+    embed.add_field(name="⚔️ Ranked Pickup", value=(
+        "`/pickup_ranked` — Challenge to a ranked pickup (ELO affected)\n"
+        "`/pickup_results` — Submit results + screenshot after the game\n"
+        "`/pickup_profile` — Your ELO, rank & stats\n"
+        "`/pickup_leaderboard` — Top 15 ELO rankings\n"
         "`/match_history` — Last 10 results"
     ), inline=False)
-    embed.add_field(name="🎮 Casual QBB", value=(
-        "`/casual_qbb` or `/qbb_casual` — Casual QBB, no ELO changes"
+    embed.add_field(name="🎮 Casual Pickup", value=(
+        "`/pickup_casual` or `/casual_pickup` — Casual pickup, no ELO changes"
     ), inline=False)
     embed.add_field(name="🏟️ League", value="`/teams` — View all 20 UFF teams", inline=False)
     embed.add_field(name="🛡️ Admin", value=(
@@ -1142,18 +1343,21 @@ async def help_uff(interaction: discord.Interaction):
         "`/adjust_elo` — Manually change ELO\n"
         "`/clear_cooldown` — Remove cooldown"
     ), inline=False)
+    embed.add_field(name="🚫 Suspensions", value=(
+        "`/suspension` — [Staff] Select a player and up to 3 reasons; games stack automatically"
+    ), inline=False)
     embed.add_field(name="📊 Ranks", value=(
-        "**Start:** 900 ELO | **Win:** +50 | **Loss:** −50\n"
+        "**Start:** 900 ELO | **Win:** +100 | **Loss:** −100\n"
         "⚙️ Iron I / II / III → 0 / 700 / 900 ELO\n"
         "🥇 Gold I / II / III → 1,100 / 1,300 / 1,500 ELO\n"
         "💎 Amethyst I / II / III → 1,700 / 1,900 / 2,100 ELO"
     ), inline=False)
     embed.add_field(name="ℹ️ How It Works", value=(
-        "1️⃣ Use `/qbb_ranked` or `/casual_qbb` to challenge someone\n"
+        "1️⃣ Use `/pickup_ranked` or `/pickup_casual` to challenge someone\n"
         "2️⃣ Opponent gets a **DM** with Accept / Decline buttons\n"
-        "3️⃣ If they accept → matchup posts publicly with @here\n"
+        "3️⃣ If they accept → matchup posts publicly with a ping\n"
         "4️⃣ If they decline → challenger is notified, no public post\n"
-        "5️⃣ After a **ranked** game, use `/qbb_results` to log the winner"
+        "5️⃣ After a **ranked** game, use `/pickup_results` to log the winner"
     ), inline=False)
     apply_branding(embed)
     embed.set_footer(text=f"{UFF_FOOTER} • {COOLDOWN_MINUTES}-min ranked cooldown")
@@ -1165,4 +1369,3 @@ async def help_uff(interaction: discord.Interaction):
 # ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot.run(TOKEN)
-
