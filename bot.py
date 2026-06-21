@@ -12,10 +12,9 @@ FLOW:
 
   /pickup_casual or /casual_pickup → same flow as ranked but no ELO, just a matchup post
 
-  /suspension → staff-only. Pick a player + up to 5 reasons (each adds a fixed
-  number of games, or applies a special status like "Ineligible Until
-  Screenshare" which adds no games), totals are summed, and a suspension
-  notice posts to the suspension channel.
+  /suspension → staff-only. Pick a player + up to 5 reasons (stackable — same
+  reason can be picked multiple times via x1/x2/x3 variants). Games add up
+  automatically. A suspension notice posts to the suspension channel.
 
   /unsuspend → staff-only. Pick a player, post a clearance notice to the
   suspension channel and mark any open suspensions for that player as cleared.
@@ -24,6 +23,7 @@ FLOW:
 import discord
 from discord import app_commands
 from discord.ext import commands
+from collections import Counter
 import json
 import os
 from datetime import datetime, timedelta
@@ -34,10 +34,10 @@ from datetime import datetime, timedelta
 TOKEN          = os.getenv("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OWNER_ID       = int(os.getenv("OWNER_DISCORD_ID", "0"))
 SECRET_KEY     = os.getenv("SECRET_KEY", "")
-QBB_CHANNEL_ID = int(os.getenv("QBB_CHANNEL_ID", "0"))  # channel where pickup matchups post
+QBB_CHANNEL_ID = int(os.getenv("QBB_CHANNEL_ID", "0"))
 
-# Banner / logo images — set these in Railway, no code changes needed to swap art
-#   UFF_BANNER_URL    -> large image shown in the matchup embed (image)
+# Banner / logo — set in Railway env vars, no code changes needed to swap art
+#   UFF_BANNER_URL    -> large image in matchup embed
 #   UFF_THUMBNAIL_URL -> small icon top-right of embeds (logo)
 UFF_THUMBNAIL  = os.getenv("UFF_THUMBNAIL_URL", "")
 UFF_BANNER     = os.getenv("UFF_BANNER_URL",    "")
@@ -45,8 +45,8 @@ UFF_BANNER     = os.getenv("UFF_BANNER_URL",    "")
 DATA_FILE = "uff_data.json"
 
 UFF_FOOTER   = "United Flag Football League"
-UFF_COLOR    = 0xF0C040   # gold
-CASUAL_COLOR = 0x5865F2   # blurple for casual
+UFF_COLOR    = 0xF0C040
+CASUAL_COLOR = 0x5865F2
 
 GUILD_ID = 1262200419564785755  # UFF server — instant command sync
 
@@ -84,30 +84,101 @@ SUSPENSION_ALLOWED_ROLE_IDS = {
     1499141732108079225,
 }
 
-# Maximum number of reasons that can be stacked on one suspension
 MAX_SUSPENSION_REASONS = 5
 
-# key -> (display label, games)
-# Normal reasons: add a fixed number of games to the total.
+# Each key maps to (base display label, games per instance).
+# x1 / x2 / x3 variants let the same reason be stacked — Discord requires
+# unique option values so we suffix them. The display strips the suffix.
 SUSPENSION_REASONS = {
-    "exploiting":             ("Exploiting",                24),
-    "dodging_screenshare":    ("Dodging Screenshare",        6),
-    "illegally_playing":      ("Illegally Playing",          2),
-    "possession_of_exploits": ("Possession of Exploits",    12),
-    "gameplay_manipulation":  ("Gameplay Manipulation",      8),
-    "alting":                 ("Alting",                    12),
-    "disbanding":             ("Disbanding",                 4),
-    "distributing_exploits":  ("Distributing Exploits",     40),
-    "distributing_alts":      ("Distributing Alt Accounts", 25),
-    "framing":                ("Framing",                   12),
-    "obstruction_of_justice": ("Obstruction of Justice",     8),
+    # Exploiting (no stacking needed)
+    "exploiting_x1":                ("Exploiting",                  24),
+
+    # Dodging Screenshare (no stacking needed)
+    "dodging_screenshare_x1":       ("Dodging Screenshare",          6),
+
+    # Illegally Playing — stackable x4
+    "illegally_playing_x1":         ("Illegally Playing",            2),
+    "illegally_playing_x2":         ("Illegally Playing",            2),
+    "illegally_playing_x3":         ("Illegally Playing",            2),
+    "illegally_playing_x4":         ("Illegally Playing",            2),
+
+    # Possession of Exploits — stackable x4
+    "possession_of_exploits_x1":    ("Possession of Exploits",      12),
+    "possession_of_exploits_x2":    ("Possession of Exploits",      12),
+    "possession_of_exploits_x3":    ("Possession of Exploits",      12),
+    "possession_of_exploits_x4":    ("Possession of Exploits",      12),
+
+    # Gameplay Manipulation (no stacking needed)
+    "gameplay_manipulation_x1":     ("Gameplay Manipulation",        8),
+
+    # Alting — stackable x4
+    "alting_x1":                    ("Alting",                      12),
+    "alting_x2":                    ("Alting",                      12),
+    "alting_x3":                    ("Alting",                      12),
+    "alting_x4":                    ("Alting",                      12),
+
+    # Disbanding (no stacking needed)
+    "disbanding_x1":                ("Disbanding",                   4),
+
+    # Distributing Exploits (no stacking needed)
+    "distributing_exploits_x1":     ("Distributing Exploits",       40),
+
+    # Distributing Alt Accounts (no stacking needed)
+    "distributing_alts_x1":         ("Distributing Alt Accounts",   25),
+
+    # Framing (no stacking needed)
+    "framing_x1":                   ("Framing",                     12),
+
+    # Obstruction of Justice (no stacking needed)
+    "obstruction_of_justice_x1":    ("Obstruction of Justice",       8),
 }
 
-# Special reasons: do NOT add games to the total. Instead they apply a
-# status label to the suspension (e.g. "Ineligible Until Screenshare").
+# Special reasons: no games added — applies a status label only
 SPECIAL_SUSPENSION_REASONS = {
     "ineligible_until_ss": "Ineligible Until Screenshare",
 }
+
+
+def _base_label(key: str) -> str:
+    """Strip the _x1/_x2/_x3 suffix to get the clean display label."""
+    return SUSPENSION_REASONS[key][0]
+
+
+def _build_suspension_summary(selected_reasons):
+    """
+    Returns (total_games, reason_lines_str, status_lines_str).
+    Groups stacked selections of the same reason into one line with a count.
+    """
+    normal_keys  = [r for r in selected_reasons if r in SUSPENSION_REASONS]
+    special_keys = [r for r in selected_reasons if r in SPECIAL_SUSPENSION_REASONS]
+
+    total_games = sum(SUSPENSION_REASONS[r][1] for r in normal_keys)
+
+    # Group by base label preserving insertion order
+    label_games: dict[str, list[int]] = {}
+    for r in normal_keys:
+        label = _base_label(r)
+        label_games.setdefault(label, []).append(SUSPENSION_REASONS[r][1])
+
+    lines = []
+    for label, game_list in label_games.items():
+        count      = len(game_list)
+        per_game   = game_list[0]
+        subtotal   = per_game * count
+        if count > 1:
+            lines.append(f"• **{label}** — {per_game} games ×{count} = **{subtotal} games**")
+        else:
+            lines.append(f"• **{label}** — {per_game} games")
+
+    reason_lines = "\n".join(lines)
+
+    status_lines = ""
+    if special_keys:
+        status_labels = [SPECIAL_SUSPENSION_REASONS[r] for r in special_keys]
+        status_lines  = "**Status:** " + ", ".join(f"`{s}`" for s in status_labels)
+
+    return total_games, reason_lines, status_lines
+
 
 # ─────────────────────────────────────────────────────────────────────
 # TEAMS  (20 official UFF teams)
@@ -223,6 +294,9 @@ async def get_suspension_channel(guild: discord.Guild):
     return await get_channel_safe(guild, SUSPENSION_CHANNEL_ID)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# EMBED BUILDERS
+# ─────────────────────────────────────────────────────────────────────
 def build_ranked_pickup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, match_id, guild, data, accepted=False
@@ -236,28 +310,16 @@ def build_ranked_pickup_embed(
     embed = discord.Embed(title="Ranked Pickup Matchup", color=UFF_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
-        value=(
-            f"<@{challenger.id}>\n"
-            f"**{your_team}**\n"
-            f"Rank: `{emoji1} {r1}`"
-        ),
+        value=f"<@{challenger.id}>\n**{your_team}**\nRank: `{emoji1} {r1}`",
         inline=True
     )
     embed.add_field(name="\u200b", value="**— VS —**", inline=True)
     embed.add_field(
         name=f"🔵 {opponent.display_name}",
-        value=(
-            f"<@{opponent.id}>\n"
-            f"**{opponent_team}**\n"
-            f"Rank: `{emoji2} {r2}`"
-        ),
+        value=f"<@{opponent.id}>\n**{opponent_team}**\nRank: `{emoji2} {r2}`",
         inline=True
     )
-    embed.add_field(
-        name="🔗 Game Link",
-        value=f"[**Click here to join →**]({game_link})",
-        inline=False
-    )
+    embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
@@ -265,9 +327,7 @@ def build_ranked_pickup_embed(
     elif guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
-    embed.set_footer(
-        text=f"Challenge issued by {challenger.display_name} | {status} • /pickup_results when done"
-    )
+    embed.set_footer(text=f"Challenge issued by {challenger.display_name} | {status} • /pickup_results when done")
     embed.timestamp = datetime.utcnow()
     return embed
 
@@ -288,11 +348,7 @@ def build_casual_pickup_embed(
         value=f"<@{opponent.id}>\n**{opponent_team}**",
         inline=True
     )
-    embed.add_field(
-        name="🔗 Game Link",
-        value=f"[**Click here to join →**]({game_link})",
-        inline=False
-    )
+    embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
@@ -300,9 +356,7 @@ def build_casual_pickup_embed(
     elif guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     status = "✅ LIVE" if accepted else "⏳ Pending acceptance..."
-    embed.set_footer(
-        text=f"Casual pickup issued by {challenger.display_name} | {status}"
-    )
+    embed.set_footer(text=f"Casual pickup issued by {challenger.display_name} | {status}")
     embed.timestamp = datetime.utcnow()
     return embed
 
@@ -386,8 +440,7 @@ async def _run_casual_pickup(interaction, opponent, game_link, your_team, oppone
         await opponent.send(embed=dm_embed, view=view)
     except discord.Forbidden:
         await interaction.response.send_message(
-            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.",
-            ephemeral=True
+            f"❌ Could not DM **{opponent.display_name}** — they have DMs disabled.", ephemeral=True
         )
         if match_id in data.get("casual_pending", {}):
             del data["casual_pending"][match_id]
@@ -702,30 +755,44 @@ class CasualPickupView(discord.ui.View):
 # ─────────────────────────────────────────────────────────────────────
 # SUSPENSION UI
 # ─────────────────────────────────────────────────────────────────────
+def _make_suspension_options():
+    """
+    Build the list of SelectOptions for the suspension dropdown.
+    Normal reasons are grouped and their x1/x2/x3 variants shown with
+    a suffix so staff can pick the same reason multiple times.
+    Discord hard-limits selects to 25 options.
+    """
+    options = []
+    seen_bases: dict[str, int] = {}  # base label -> count of variants added
+
+    for key, (label, games) in SUSPENSION_REASONS.items():
+        seen_bases[label] = seen_bases.get(label, 0) + 1
+        instance = seen_bases[label]
+        if instance == 1:
+            display = f"{label} — {games} games"
+            desc    = f"Adds {games} games"
+        else:
+            display = f"{label} (×{instance}) — +{games} games"
+            desc    = f"Stack: adds another {games} games"
+        options.append(
+            discord.SelectOption(label=display, value=key, description=desc)
+        )
+
+    for key, label in SPECIAL_SUSPENSION_REASONS.items():
+        options.append(
+            discord.SelectOption(
+                label=label,
+                value=key,
+                description="Status only — no games added"
+            )
+        )
+
+    return options[:25]  # Discord hard limit
+
+
 class SuspensionReasonSelect(discord.ui.Select):
     def __init__(self):
-        options = []
-
-        # Normal reasons — add games to the total
-        for key, (label, games) in SUSPENSION_REASONS.items():
-            options.append(
-                discord.SelectOption(
-                    label=f"{label} — {games} games",
-                    value=key,
-                    description=f"Adds {games} games to the suspension total"
-                )
-            )
-
-        # Special reasons — no games added, sets a status label instead
-        for key, label in SPECIAL_SUSPENSION_REASONS.items():
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    value=key,
-                    description="Status only — no games added to the total"
-                )
-            )
-
+        options = _make_suspension_options()
         super().__init__(
             placeholder=f"Select up to {MAX_SUSPENSION_REASONS} reasons...",
             min_values=1,
@@ -739,35 +806,15 @@ class SuspensionReasonSelect(discord.ui.Select):
 
         total_games, reason_lines, status_lines = _build_suspension_summary(view.selected_reasons)
 
-        preview = f"**Suspension preview — {view.target.display_name}**\n\n"
+        preview  = f"**Suspension preview — {view.target.display_name}**\n\n"
         if reason_lines:
             preview += reason_lines + "\n\n"
         if status_lines:
             preview += status_lines + "\n\n"
         preview += f"**Total: {total_games} games**\n\n"
-        preview += "Click **Confirm & Post** to publish this suspension, or change your selection above."
+        preview += "Click **Confirm & Post** to publish, or change your selection above."
 
         await interaction.response.edit_message(content=preview, view=view)
-
-
-def _build_suspension_summary(selected_reasons):
-    """Returns (total_games, reason_lines_str, status_lines_str) for the given reason keys."""
-    normal_keys  = [r for r in selected_reasons if r in SUSPENSION_REASONS]
-    special_keys = [r for r in selected_reasons if r in SPECIAL_SUSPENSION_REASONS]
-
-    total_games = sum(SUSPENSION_REASONS[r][1] for r in normal_keys)
-
-    reason_lines = "\n".join(
-        f"• **{SUSPENSION_REASONS[r][0]}** — {SUSPENSION_REASONS[r][1]} games"
-        for r in normal_keys
-    )
-
-    status_lines = ""
-    if special_keys:
-        status_labels = [SPECIAL_SUSPENSION_REASONS[r] for r in special_keys]
-        status_lines = "**Status:** " + ", ".join(f"`{s}`" for s in status_labels)
-
-    return total_games, reason_lines, status_lines
 
 
 class SuspensionConfirmButton(discord.ui.Button):
@@ -787,22 +834,17 @@ class SuspensionConfirmButton(discord.ui.Button):
 
         embed = discord.Embed(title="🚫 Player Suspension", color=0xED4245)
         embed.add_field(name="Player", value=f"<@{view.target.id}> ({view.target.display_name})", inline=False)
-
         if reason_lines:
             embed.add_field(name="Reason(s)", value=reason_lines, inline=False)
-
         if status_lines:
             embed.add_field(name="Additional Status", value=status_lines, inline=False)
-
         embed.add_field(name="Total Games Suspended", value=f"**{total_games} games**", inline=False)
-
         if view.target.avatar:
             embed.set_thumbnail(url=view.target.avatar.url)
         embed.set_footer(text=f"Issued by {interaction.user.display_name} | {UFF_FOOTER}")
         embed.timestamp = datetime.utcnow()
 
         ch = await get_suspension_channel(interaction.guild)
-
         for item in view.children:
             item.disabled = True
 
@@ -811,21 +853,20 @@ class SuspensionConfirmButton(discord.ui.Button):
             await interaction.response.edit_message(
                 content=f"✅ Suspension posted to {ch.mention}.", view=view
             )
-
             normal_keys  = [r for r in view.selected_reasons if r in SUSPENSION_REASONS]
             special_keys = [r for r in view.selected_reasons if r in SPECIAL_SUSPENSION_REASONS]
-
             data = load_data()
             data.setdefault("suspensions", []).append({
-                "player_id":     str(view.target.id),
-                "player_name":   view.target.display_name,
-                "reasons":       [SUSPENSION_REASONS[r][0] for r in normal_keys],
-                "status_flags":  [SPECIAL_SUSPENSION_REASONS[r] for r in special_keys],
-                "total_games":   total_games,
-                "issued_by":     str(interaction.user.id),
+                "player_id":      str(view.target.id),
+                "player_name":    view.target.display_name,
+                "reason_keys":    normal_keys,
+                "reasons":        [_base_label(r) for r in normal_keys],
+                "status_flags":   [SPECIAL_SUSPENSION_REASONS[r] for r in special_keys],
+                "total_games":    total_games,
+                "issued_by":      str(interaction.user.id),
                 "issued_by_name": interaction.user.display_name,
-                "date":          datetime.utcnow().isoformat(),
-                "cleared":       False,
+                "date":           datetime.utcnow().isoformat(),
+                "cleared":        False,
             })
             save_data(data)
         else:
@@ -843,15 +884,17 @@ class SuspensionCancelButton(discord.ui.Button):
         view: SuspensionView = self.view
         for item in view.children:
             item.disabled = True
-        await interaction.response.edit_message(content="❌ Suspension cancelled — nothing was posted.", view=view)
+        await interaction.response.edit_message(
+            content="❌ Suspension cancelled — nothing was posted.", view=view
+        )
         view.stop()
 
 
 class SuspensionView(discord.ui.View):
     def __init__(self, target: discord.Member, issuer_id: int):
         super().__init__(timeout=300)
-        self.target = target
-        self.issuer_id = issuer_id
+        self.target           = target
+        self.issuer_id        = issuer_id
         self.selected_reasons = []
         self.add_item(SuspensionReasonSelect())
         self.add_item(SuspensionConfirmButton())
@@ -885,12 +928,12 @@ async def on_ready():
     await bot.tree.sync(guild=guild_obj)
     await bot.tree.sync()
     print(f"✅ UFF Bot online — {bot.user}")
-    print(f"   Guild        : {GUILD_ID}")
+    print(f"   Guild             : {GUILD_ID}")
     print(f"   Pickup Channel    : {QBB_CHANNEL_ID or 'not set'}")
     print(f"   Suspension Channel: {SUSPENSION_CHANNEL_ID or 'not set'}")
-    print(f"   Owner ID     : {OWNER_ID}")
-    print(f"   Thumbnail    : {'set' if UFF_THUMBNAIL else 'NOT SET'}")
-    print(f"   Banner       : {'set' if UFF_BANNER else 'NOT SET'}")
+    print(f"   Owner ID          : {OWNER_ID}")
+    print(f"   Thumbnail         : {'set' if UFF_THUMBNAIL else 'NOT SET'}")
+    print(f"   Banner            : {'set' if UFF_BANNER else 'NOT SET'}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -969,21 +1012,13 @@ async def pickup_ranked(
     )
     dm_embed.add_field(
         name=f"🟡 {interaction.user.display_name}",
-        value=(
-            f"`{interaction.user.name}`\n"
-            f"**{your_team}**\n"
-            f"Rank: `{emoji1} {r1}`"
-        ),
+        value=f"`{interaction.user.name}`\n**{your_team}**\nRank: `{emoji1} {r1}`",
         inline=True
     )
     dm_embed.add_field(name="\u200b", value="**— VS —**", inline=True)
     dm_embed.add_field(
         name=f"🔵 {opponent.display_name}",
-        value=(
-            f"`{opponent.name}`\n"
-            f"**{opponent_team}**\n"
-            f"Rank: `{emoji2} {r2}`"
-        ),
+        value=f"`{opponent.name}`\n**{opponent_team}**\nRank: `{emoji2} {r2}`",
         inline=True
     )
     dm_embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
@@ -1055,7 +1090,7 @@ async def pickup_casual(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /casual_pickup  — same as /pickup_casual, alternate name
+# /casual_pickup  — alternate name
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="casual_pickup", description="Challenge another player to a casual (unranked) pickup — no ELO changes")
 @app_commands.describe(
@@ -1239,7 +1274,7 @@ async def pickup_leaderboard(interaction: discord.Interaction):
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, (uid, p) in enumerate(top):
-        elo = p["elo"]
+        elo   = p["elo"]
         rank, emoji, _ = get_rank(elo)
         medal = medals[i] if i < 3 else f"`{i + 1}.`"
         name  = p.get("username") or f"<@{uid}>"
@@ -1366,12 +1401,12 @@ async def suspension(interaction: discord.Interaction, player: discord.Member):
             "❌ You don't have permission to issue suspensions.", ephemeral=True
         )
         return
-
     view = SuspensionView(target=player, issuer_id=interaction.user.id)
     await interaction.response.send_message(
         content=(
             f"**Issuing suspension for {player.display_name}**\n"
-            f"Select up to {MAX_SUSPENSION_REASONS} reasons below. Games stack and total automatically."
+            f"Select up to {MAX_SUSPENSION_REASONS} reasons below. "
+            f"Pick the same reason multiple times (×2, ×3) to stack games."
         ),
         view=view,
         ephemeral=True
@@ -1394,10 +1429,10 @@ async def unsuspend(interaction: discord.Interaction, player: discord.Member):
     cleared_any = False
     for s in data.get("suspensions", []):
         if s.get("player_id") == str(player.id) and not s.get("cleared", False):
-            s["cleared"]      = True
-            s["cleared_by"]   = str(interaction.user.id)
-            s["cleared_by_name"] = interaction.user.display_name
-            s["cleared_date"] = datetime.utcnow().isoformat()
+            s["cleared"]          = True
+            s["cleared_by"]       = str(interaction.user.id)
+            s["cleared_by_name"]  = interaction.user.display_name
+            s["cleared_date"]     = datetime.utcnow().isoformat()
             cleared_any = True
     save_data(data)
 
@@ -1406,13 +1441,13 @@ async def unsuspend(interaction: discord.Interaction, player: discord.Member):
     embed.add_field(name="Status", value="**Cleared** — eligible to play", inline=False)
     if player.avatar:
         embed.set_thumbnail(url=player.avatar.url)
-    embed.set_footer(text=f"Issued by {interaction.user.display_name} | {UFF_FOOTER}")
+    embed.set_footer(text=f"Cleared by {interaction.user.display_name} | {UFF_FOOTER}")
     embed.timestamp = datetime.utcnow()
 
     ch = await get_suspension_channel(interaction.guild)
     if ch:
         await ch.send(embed=embed)
-        note = "" if cleared_any else "\n*(No open suspension records were found for this player, but the notice was still posted.)*"
+        note = "" if cleared_any else "\n*(No open suspension records found, but the notice was posted anyway.)*"
         await interaction.response.send_message(
             f"✅ {player.display_name} has been unsuspended. Notice posted to {ch.mention}.{note}",
             ephemeral=True
@@ -1447,7 +1482,7 @@ async def help_uff(interaction: discord.Interaction):
         "`/clear_cooldown` — Remove cooldown"
     ), inline=False)
     embed.add_field(name="🚫 Suspensions", value=(
-        f"`/suspension` — [Staff] Select a player and up to {MAX_SUSPENSION_REASONS} reasons; games stack automatically\n"
+        f"`/suspension` — [Staff] Pick a player + up to {MAX_SUSPENSION_REASONS} reasons (stack same reason via ×2/×3)\n"
         "`/unsuspend` — [Staff] Clear a player's suspension and post a clearance notice"
     ), inline=False)
     embed.add_field(name="📊 Ranks", value=(
