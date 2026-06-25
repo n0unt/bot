@@ -626,7 +626,7 @@ async def post_transaction(guild: discord.Guild, team: dict, embed: discord.Embe
     ping_str = team_role.mention if team_role else ""
 
     if ch:
-        await ch.send(content=ping_str if ping_str else None, embed=embed)
+        await ch.send(embed=embed)
         if followup and ephemeral_msg:
             await followup.send(ephemeral_msg, ephemeral=ephemeral)
         elif interaction and ephemeral_msg:
@@ -720,6 +720,13 @@ class OfferView(discord.ui.View):
         color     = team.get("color", UFF_COLOR)
         role_str  = team_role.mention if team_role else f"**{team['name']}**"
 
+        # Give the player their team Discord role
+        if team_role:
+            try:
+                await player.add_roles(team_role, reason=f"Signed to {team['name']}")
+            except discord.Forbidden:
+                pass
+
         embed = discord.Embed(title="signed", color=color)
         embed.description = (
             f"{role_str} have **signed** <@{player.id}> (@{player.name})\n"
@@ -734,8 +741,7 @@ class OfferView(discord.ui.View):
 
         ch = await get_transactions_channel(guild)
         if ch:
-            ping_str = team_role.mention if team_role else ""
-            await ch.send(content=ping_str if ping_str else None, embed=embed)
+            await ch.send(embed=embed)
 
         accepted_embed = discord.Embed(
             title="✅ Offer Accepted!",
@@ -1186,7 +1192,14 @@ async def set_team(interaction: discord.Interaction, team_role: discord.Role):
 
     # Pull name and logo directly from the Discord role
     team_name = team_role.name
-    logo_url  = str(team_role.display_icon) if team_role.display_icon else ""
+    icon      = team_role.display_icon
+    if icon is None:
+        logo_url = ""
+    elif isinstance(icon, discord.PartialEmoji):
+        logo_url = str(icon.url) if icon.url else ""
+    else:
+        # discord.Asset
+        logo_url = str(icon.url)
 
     data = await load_data()
     rid  = str(team_role.id)
@@ -1395,6 +1408,13 @@ async def release(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer(ephemeral=False, thinking=True)
 
     team_role = get_team_role(interaction.guild, rid)
+    # Remove the team Discord role from the released player
+    if team_role and team_role in player.roles:
+        try:
+            await player.remove_roles(team_role, reason=f"Released from {team['name']}")
+        except discord.Forbidden:
+            pass
+
     embed = await build_transaction_embed("released", player, team, team_role, interaction.guild, color=0xED4245)
     await post_transaction(interaction.guild, team, embed, team_role, followup=interaction.followup,
                            ephemeral_msg=f"✅ Released **{player.display_name}** from **{team['name']}**.")
@@ -1440,7 +1460,15 @@ async def demand_release(interaction: discord.Interaction):
     roblox_name   = blox.get("roblox_username", "Unknown")
     roblox_avatar = blox.get("avatar_url", "")
     team_role     = get_team_role(interaction.guild, found_rid)
-    role_str      = team_role.mention if team_role else f"**{found_team['name']}**"
+
+    # Remove the team Discord role from the player
+    if team_role and team_role in interaction.user.roles:
+        try:
+            await interaction.user.remove_roles(team_role, reason=f"Demand release from {found_team['name']}")
+        except discord.Forbidden:
+            pass
+
+    role_str = team_role.mention if team_role else f"**{found_team['name']}**"
 
     embed = discord.Embed(title="demand release", color=0xED4245)
     embed.description = (
@@ -1611,14 +1639,27 @@ async def disband(interaction: discord.Interaction, confirm: str, team_role: dis
             "❌ You're not registered as head coach of any team. Staff must also provide `team_role`.",
             ephemeral=True); return
 
-    team_name   = team["name"]
-    former_size = len(team.get("roster", []))
+    team_name    = team["name"]
+    former_roster = list(team.get("roster", []))
+    former_size  = len(former_roster)
     team["roster"] = []
     team["head_coach_id"] = None; team["head_coach_name"] = None; team["head_coach_roblox"] = ""
     team["ahc_id"] = None; team["ahc_name"] = None; team["ahc_roblox"] = ""
     await save_data(data)
 
     tr = get_team_role(interaction.guild, rid)
+
+    # Strip the team Discord role from every former member
+    if tr:
+        for member_data in former_roster:
+            try:
+                member = interaction.guild.get_member(int(member_data["id"])) or \
+                         await interaction.guild.fetch_member(int(member_data["id"]))
+                if tr in member.roles:
+                    await member.remove_roles(tr, reason=f"{team_name} disbanded")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
     embed = discord.Embed(title="team disbanded", color=0xED4245)
     embed.description = (f"**{team_name}** has been disbanded.\n"
                          f"All **{former_size}** player(s) and coaches have been removed.")
