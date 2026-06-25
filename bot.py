@@ -18,15 +18,30 @@ LATEST UPDATE:
     so thumbnails never render blank even if a team has no logo set.
   - /coaches is now a single vertical list (no more two-column layout) and uses the
     league logo (ZEVORA_LOGO_URL) as its thumbnail instead of a team logo.
-  - Transaction pings (team role mention) are now actually sent as a separate plain-text
-    message AFTER the embed (previously the ping variable was built but never sent).
-    This applies to /release, /demand, /promote_coach, /demote_coach, and offer-accept (signing).
   - All non-staff command responses are now ephemeral. Where a command also produces a
     real public record (pickup results, disband notice), the ephemeral ack now stays
     private to the user while the actual result is still posted publicly to the channel.
   - Staff roles updated: removed Moderators (1404271074623099040); added Co-Founder,
     Zevora, and Advisory roles.
   - Added ZEVORA_LOGO_URL env var for the league logo (set in Railway).
+
+  - Transaction embeds reworked to match the compact reference layout:
+      * The role ping lives INSIDE the embed again (first word of the description) —
+        no separate plain-text ping message after the embed anymore.
+      * The big full-size headshot image at the bottom of the embed is gone — that
+        was what made embeds so tall.
+      * The embed's thumbnail (top-right corner) is now a composited badge: the
+        player's Roblox headshot with the team logo peeking out from behind its
+        bottom-right corner, generated on the fly with Pillow. Falls back to a
+        plain team-logo thumbnail if compositing fails for any reason (missing
+        Pillow, bad image URL, etc).
+      * Requires `Pillow` in requirements.txt on Railway — add it if it's not there.
+  - Role grant/removal (signing, /assign_hc, /promote_coach, /demote_coach, /release,
+    /demand, /disband) no longer silently swallows failures. If the bot can't add or
+    remove a Discord role (most commonly: the bot's own role sits BELOW that role in
+    Server Settings → Roles, or it's missing Manage Roles), the staff member running
+    the command now sees a ⚠️ warning explaining that, instead of the role change just
+    silently not happening.
 
 TRANSACTIONS FLOW:
   /set_team            — [Staff] Register a Discord role as a UFF team
@@ -68,8 +83,15 @@ from discord.ext import commands
 import json
 import os
 import aiohttp
+from io import BytesIO
 from datetime import datetime, timedelta
 import asyncpg
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────
 # ENVIRONMENT VARIABLES  (set these in Railway)
@@ -452,6 +474,71 @@ async def bloxlink_lookup(discord_id: int, guild_id: int) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# BADGE IMAGE COMPOSITING  — player headshot + team logo, single image
+# ─────────────────────────────────────────────────────────────────────
+async def _fetch_image_bytes(url: str) -> bytes | None:
+    if not url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception:
+        return None
+    return None
+
+
+async def build_badge_file(headshot_url: str, logo_url: str, size: int = 256) -> discord.File | None:
+    """
+    Composite the player's Roblox headshot with the team logo peeking out from
+    behind its bottom-right corner, returned as a discord.File named 'badge.png'.
+    Use embed.set_thumbnail(url="attachment://badge.png") and send the file
+    alongside the embed. Returns None if Pillow isn't installed, the headshot
+    couldn't be fetched, or anything else goes wrong — callers should fall back
+    to a plain logo thumbnail in that case.
+    """
+    if not PIL_AVAILABLE:
+        return None
+
+    headshot_bytes = await _fetch_image_bytes(headshot_url)
+    if not headshot_bytes:
+        return None
+
+    try:
+        headshot = Image.open(BytesIO(headshot_bytes)).convert("RGBA").resize((size, size))
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+        logo_bytes = await _fetch_image_bytes(logo_url) if logo_url else None
+        if logo_bytes:
+            try:
+                logo = Image.open(BytesIO(logo_bytes)).convert("RGBA")
+                logo_size = int(size * 0.58)
+                logo = logo.resize((logo_size, logo_size))
+                # Logo goes down first, peeking out from behind the bottom-right
+                # corner of the headshot — the headshot is then layered on top of it.
+                offset = size - int(logo_size * 0.62)
+                canvas.paste(logo, (offset, offset), logo)
+            except Exception:
+                pass
+
+        canvas.paste(headshot, (0, 0), headshot)
+
+        buf = BytesIO()
+        canvas.save(buf, format="PNG")
+        buf.seek(0)
+        return discord.File(buf, filename="badge.png")
+    except Exception:
+        return None
+
+
+def _role_failure_note(role_label: str) -> str:
+    return (f"\n⚠️ Could not update their **{role_label}** Discord role — check that this "
+            f"bot's role is positioned ABOVE that role in Server Settings → Roles, and that "
+            f"the bot has **Manage Roles** permission.")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # TRANSACTION HELPERS
 # ─────────────────────────────────────────────────────────────────────
 def get_team_by_role(data: dict, role_id: int) -> dict | None:
@@ -579,9 +666,11 @@ def build_casual_pickup_embed(challenger, opponent, your_team, opponent_team,
 
 async def build_transaction_embed(action: str, player: discord.Member, team: dict,
                                    team_role, guild: discord.Guild,
-                                   color: int = UFF_COLOR) -> discord.Embed:
+                                   color: int = UFF_COLOR) -> tuple[discord.Embed, discord.File | None]:
     """
-    Transaction embed: team logo as thumbnail (inside embed), player headshot as image.
+    Compact transaction embed: role ping is the first word of the description,
+    thumbnail is a composited badge (player headshot + team logo peeking out from
+    behind its corner). Returns (embed, file) — send both together; file may be None.
     """
     embed = discord.Embed(title=action.lower(), color=color)
 
@@ -596,21 +685,21 @@ async def build_transaction_embed(action: str, player: discord.Member, team: dic
     )
     embed.add_field(name="\u200b", value=_info_block(team), inline=False)
 
-    # Team logo as thumbnail (top-right corner, INSIDE the embed)
-    _set_team_thumbnail(embed, team, guild)
-    # Player Roblox headshot as the large image at the bottom of the embed
-    if roblox_avatar:
-        embed.set_image(url=roblox_avatar)
+    file = await build_badge_file(roblox_avatar, team.get("logo_url", ""))
+    if file:
+        embed.set_thumbnail(url="attachment://badge.png")
+    else:
+        _set_team_thumbnail(embed, team, guild)
 
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    return embed
+    return embed, file
 
 
 async def build_coach_transaction_embed(action: str, player: discord.Member, team: dict,
                                          team_role, guild: discord.Guild,
-                                         color: int = UFF_COLOR) -> discord.Embed:
-    """Embed for coach promotions / demotions."""
+                                         color: int = UFF_COLOR) -> tuple[discord.Embed, discord.File | None]:
+    """Compact embed for coach promotions / demotions. Returns (embed, file)."""
     embed = discord.Embed(title=action.lower(), color=color)
 
     blox          = await bloxlink_lookup(player.id, guild.id)
@@ -627,33 +716,33 @@ async def build_coach_transaction_embed(action: str, player: discord.Member, tea
     )
     embed.add_field(name="\u200b", value=_info_block(team), inline=False)
 
-    _set_team_thumbnail(embed, team, guild)
-    if roblox_avatar:
-        embed.set_image(url=roblox_avatar)
+    file = await build_badge_file(roblox_avatar, team.get("logo_url", ""))
+    if file:
+        embed.set_thumbnail(url="attachment://badge.png")
+    else:
+        _set_team_thumbnail(embed, team, guild)
 
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    return embed
+    return embed, file
 
 
 async def post_transaction(guild: discord.Guild, team: dict, embed: discord.Embed,
                             team_role, followup=None, interaction=None,
-                            ephemeral_msg="", ephemeral: bool = True):
+                            ephemeral_msg="", ephemeral: bool = True,
+                            file: discord.File | None = None):
     """
-    Post transaction embed to the shared transactions channel.
-    Logo is already set as the embed thumbnail — no plain message needed for that.
-
-    The team role ping is sent as its own plain-text message AFTER the embed, so the
-    player headshot / embed shows first and the role ping (which actually triggers a
-    notification) follows it, outside the embed.
+    Post transaction embed to the shared transactions channel. The role ping lives
+    inside the embed itself (first word of the description) — no separate ping
+    message is sent. `file` is the composited badge attachment, if any.
     """
-    ch       = await get_transactions_channel(guild)
-    ping_str = team_role.mention if team_role else ""
+    ch = await get_transactions_channel(guild)
 
     if ch:
-        await ch.send(embed=embed)
-        if ping_str:
-            await ch.send(content=ping_str)
+        if file:
+            await ch.send(embed=embed, file=file)
+        else:
+            await ch.send(embed=embed)
         if followup and ephemeral_msg:
             await followup.send(ephemeral_msg, ephemeral=ephemeral)
         elif interaction and ephemeral_msg:
@@ -663,12 +752,18 @@ async def post_transaction(guild: discord.Guild, team: dict, embed: discord.Embe
                 await interaction.followup.send(ephemeral_msg, ephemeral=ephemeral)
     else:
         if followup:
-            await followup.send(embed=embed)
+            await followup.send(embed=embed, file=file) if file else await followup.send(embed=embed)
         elif interaction:
             try:
-                await interaction.response.send_message(embed=embed)
+                if file:
+                    await interaction.response.send_message(embed=embed, file=file)
+                else:
+                    await interaction.response.send_message(embed=embed)
             except discord.InteractionResponded:
-                await interaction.followup.send(embed=embed)
+                if file:
+                    await interaction.followup.send(embed=embed, file=file)
+                else:
+                    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -748,11 +843,14 @@ class OfferView(discord.ui.View):
         role_str  = team_role.mention if team_role else f"**{team['name']}**"
 
         # Give the player their team Discord role
+        role_failed = False
         if team_role:
             try:
                 await player.add_roles(team_role, reason=f"Signed to {team['name']}")
             except discord.Forbidden:
-                pass
+                role_failed = True
+        else:
+            role_failed = True
 
         embed = discord.Embed(title="signed", color=color)
         embed.description = (
@@ -760,25 +858,31 @@ class OfferView(discord.ui.View):
             f"`{roblox_name}`"
         )
         embed.add_field(name="\u200b", value=_info_block(team), inline=False)
-        _set_team_thumbnail(embed, team, guild)
-        if roblox_avatar:
-            embed.set_image(url=roblox_avatar)
+        file = await build_badge_file(roblox_avatar, team.get("logo_url", ""))
+        if file:
+            embed.set_thumbnail(url="attachment://badge.png")
+        else:
+            _set_team_thumbnail(embed, team, guild)
         embed.set_footer(text=UFF_FOOTER)
         embed.timestamp = datetime.utcnow()
 
         ch = await get_transactions_channel(guild)
         if ch:
-            # Headshot/embed posts first, then the team role ping as its own
-            # plain-text message AFTER it (outside the embed) so it actually notifies.
-            await ch.send(embed=embed)
-            if team_role:
-                await ch.send(content=team_role.mention)
+            if file:
+                await ch.send(embed=embed, file=file)
+            else:
+                await ch.send(embed=embed)
 
         accepted_embed = discord.Embed(
             title="✅ Offer Accepted!",
             description=f"You accepted the offer from **{self.team_name}**!\n\nWelcome to the team.",
             color=0x57F287
         )
+        if role_failed:
+            accepted_embed.description += (
+                "\n\n⚠️ Heads up — the team Discord role couldn't be added automatically. "
+                "Ask a coach or staff member to add it manually."
+            )
         if self.team_logo:
             accepted_embed.set_thumbnail(url=self.team_logo)
         accepted_embed.set_footer(text=UFF_FOOTER)
@@ -1320,14 +1424,19 @@ async def assign_hc(interaction: discord.Interaction, team_role: discord.Role, p
 
     # Give the Head Coach Discord role
     hc_role = interaction.guild.get_role(HEAD_COACH_ROLE_ID)
+    role_failed = False
     if hc_role:
         try:
             await player.add_roles(hc_role, reason="Assigned as Head Coach via /assign_hc")
         except discord.Forbidden:
-            pass
+            role_failed = True
+    else:
+        role_failed = True
 
-    await interaction.followup.send(
-        f"✅ **{player.display_name}** is now head coach of **{team['name']}**.", ephemeral=True)
+    msg = f"✅ **{player.display_name}** is now head coach of **{team['name']}**."
+    if role_failed:
+        msg += _role_failure_note("Head Coach")
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1448,15 +1557,19 @@ async def release(interaction: discord.Interaction, player: discord.Member):
 
     team_role = get_team_role(interaction.guild, rid)
     # Remove the team Discord role from the released player
+    role_failed = False
     if team_role and team_role in player.roles:
         try:
             await player.remove_roles(team_role, reason=f"Released from {team['name']}")
         except discord.Forbidden:
-            pass
+            role_failed = True
 
-    embed = await build_transaction_embed("released", player, team, team_role, interaction.guild, color=0xED4245)
+    embed, file = await build_transaction_embed("released", player, team, team_role, interaction.guild, color=0xED4245)
+    msg = f"✅ Released **{player.display_name}** from **{team['name']}**."
+    if role_failed:
+        msg += _role_failure_note(team['name'])
     await post_transaction(interaction.guild, team, embed, team_role, followup=interaction.followup,
-                           ephemeral_msg=f"✅ Released **{player.display_name}** from **{team['name']}**.")
+                           ephemeral_msg=msg, file=file)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1501,11 +1614,12 @@ async def demand(interaction: discord.Interaction):
     team_role     = get_team_role(interaction.guild, found_rid)
 
     # Remove the team Discord role from the player
+    role_failed = False
     if team_role and team_role in interaction.user.roles:
         try:
             await interaction.user.remove_roles(team_role, reason=f"Demand release from {found_team['name']}")
         except discord.Forbidden:
-            pass
+            role_failed = True
 
     role_str = team_role.mention if team_role else f"**{found_team['name']}**"
 
@@ -1515,14 +1629,19 @@ async def demand(interaction: discord.Interaction):
         f"has demanded a release from the {role_str}!"
     )
     embed.add_field(name="\u200b", value=_info_block(found_team), inline=False)
-    _set_team_thumbnail(embed, found_team, interaction.guild)
-    if roblox_avatar:
-        embed.set_image(url=roblox_avatar)
+    file = await build_badge_file(roblox_avatar, found_team.get("logo_url", ""))
+    if file:
+        embed.set_thumbnail(url="attachment://badge.png")
+    else:
+        _set_team_thumbnail(embed, found_team, interaction.guild)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
 
+    msg = f"✅ You have demanded from **{found_team['name']}** This will be posted in transactions channel."
+    if role_failed:
+        msg += _role_failure_note(found_team['name'])
     await post_transaction(interaction.guild, found_team, embed, team_role, followup=interaction.followup,
-                           ephemeral_msg=f"✅ You have demanded from **{found_team['name']}** This will be posted in transactions channel.")
+                           ephemeral_msg=msg, file=file)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1585,23 +1704,31 @@ async def promote_coach(interaction: discord.Interaction, player: discord.Member
     # Give AHC Discord role; remove HC role if they had it
     ahc_role = interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
     hc_role  = interaction.guild.get_role(HEAD_COACH_ROLE_ID)
+    role_failed = False
     try:
-        if ahc_role: await player.add_roles(ahc_role, reason="Promoted to AHC via /promote_coach")
+        if ahc_role:
+            await player.add_roles(ahc_role, reason="Promoted to AHC via /promote_coach")
+        else:
+            role_failed = True
         if hc_role and hc_role in player.roles:
             await player.remove_roles(hc_role, reason="Promoted to AHC — removing HC role")
     except discord.Forbidden:
-        pass
+        role_failed = True
 
     team_role = get_team_role(interaction.guild, rid)
-    embed = await build_coach_transaction_embed("assistant coach promotion", player, team,
+    embed, file = await build_coach_transaction_embed("assistant coach promotion", player, team,
                                                 team_role, interaction.guild,
                                                 color=team.get("color", UFF_COLOR))
+    msg = f"✅ **{player.display_name}** promoted to AHC of **{team['name']}**."
+    if role_failed:
+        msg += _role_failure_note("Assistant Coach")
     # Post the public transaction embed, then send ephemeral confirmation to the command runner
     await post_transaction(
         interaction.guild, team, embed, team_role,
         followup=interaction.followup,
-        ephemeral_msg=f"✅ **{player.display_name}** promoted to AHC of **{team['name']}**.",
-        ephemeral=True
+        ephemeral_msg=msg,
+        ephemeral=True,
+        file=file
     )
 
 
@@ -1636,20 +1763,25 @@ async def demote_coach(interaction: discord.Interaction, player: discord.Member)
 
     # Remove AHC Discord role
     ahc_role = interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
+    role_failed = False
     try:
         if ahc_role and ahc_role in player.roles:
             await player.remove_roles(ahc_role, reason="Demoted from AHC via /demote_coach")
     except discord.Forbidden:
-        pass
+        role_failed = True
 
     team_role = get_team_role(interaction.guild, rid)
-    embed = await build_coach_transaction_embed("assistant coach demotion", player, team,
+    embed, file = await build_coach_transaction_embed("assistant coach demotion", player, team,
                                                 team_role, interaction.guild, color=0xED4245)
+    msg = f"✅ **{player.display_name}** demoted from AHC of **{team['name']}**."
+    if role_failed:
+        msg += _role_failure_note("Assistant Coach")
     await post_transaction(
         interaction.guild, team, embed, team_role,
         followup=interaction.followup,
-        ephemeral_msg=f"✅ **{player.display_name}** demoted from AHC of **{team['name']}**.",
-        ephemeral=True
+        ephemeral_msg=msg,
+        ephemeral=True,
+        file=file
     )
 
 
@@ -1689,6 +1821,7 @@ async def disband(interaction: discord.Interaction, confirm: str, team_role: dis
     tr = get_team_role(interaction.guild, rid)
 
     # Strip the team Discord role from every former member
+    role_fail_count = 0
     if tr:
         for member_data in former_roster:
             try:
@@ -1696,7 +1829,9 @@ async def disband(interaction: discord.Interaction, confirm: str, team_role: dis
                          await interaction.guild.fetch_member(int(member_data["id"]))
                 if tr in member.roles:
                     await member.remove_roles(tr, reason=f"{team_name} disbanded")
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            except discord.Forbidden:
+                role_fail_count += 1
+            except (discord.NotFound, discord.HTTPException):
                 pass
 
     embed = discord.Embed(title="team disbanded", color=0xED4245)
@@ -1707,16 +1842,21 @@ async def disband(interaction: discord.Interaction, confirm: str, team_role: dis
     embed.set_footer(text=f"Disbanded by {interaction.user.display_name} | {UFF_FOOTER}")
     embed.timestamp = datetime.utcnow()
 
+    role_note = ""
+    if role_fail_count:
+        role_note = (f"\n⚠️ Couldn't remove the team role from {role_fail_count} former member(s) — "
+                     f"check the bot's role position in Server Settings → Roles.")
+
     ch = await get_transactions_channel(interaction.guild)
     if ch:
         await ch.send(embed=embed)
         await interaction.response.send_message(
-            f"✅ **{team_name}** has been disbanded. Posted to {ch.mention}.", ephemeral=True)
+            f"✅ **{team_name}** has been disbanded. Posted to {ch.mention}.{role_note}", ephemeral=True)
     else:
         # No transactions channel configured — keep the actual announcement public in the
         # current channel, but the ack to the command runner stays ephemeral.
         await interaction.response.send_message(
-            f"✅ **{team_name}** has been disbanded. (No transactions channel configured — posting here.)",
+            f"✅ **{team_name}** has been disbanded. (No transactions channel configured — posting here.){role_note}",
             ephemeral=True)
         await interaction.channel.send(embed=embed)
 
