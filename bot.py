@@ -13,13 +13,28 @@ CHANGES FROM PREVIOUS VERSION:
   - demote_coach  → removes ASSISTANT_COACH_ROLE_ID
   - /coaches shows team logo as thumbnail for each team listed
 
+LATEST UPDATE:
+  - Team/league logo thumbnails now always fall back: team logo_url -> ZEVORA_LOGO_URL -> guild icon,
+    so thumbnails never render blank even if a team has no logo set.
+  - /coaches is now a single vertical list (no more two-column layout) and uses the
+    league logo (ZEVORA_LOGO_URL) as its thumbnail instead of a team logo.
+  - Transaction pings (team role mention) are now actually sent as a separate plain-text
+    message AFTER the embed (previously the ping variable was built but never sent).
+    This applies to /release, /demand, /promote_coach, /demote_coach, and offer-accept (signing).
+  - All non-staff command responses are now ephemeral. Where a command also produces a
+    real public record (pickup results, disband notice), the ephemeral ack now stays
+    private to the user while the actual result is still posted publicly to the channel.
+  - Staff roles updated: removed Moderators (1404271074623099040); added Co-Founder,
+    Zevora, and Advisory roles.
+  - Added ZEVORA_LOGO_URL env var for the league logo (set in Railway).
+
 TRANSACTIONS FLOW:
   /set_team            — [Staff] Register a Discord role as a UFF team
   /set_team_image      — [Staff] Override the team logo URL for a team role
   /assign_hc           — [Staff] Assign a head coach to a team
   /offer               — [HC/AHC/Staff] Send a player a roster offer via DM (12h window)
   /release             — [HC/AHC/Staff] Release a player (auto-detected team)
-  /demand_release      — Player demands their own release (1 lifetime demand)
+  /demand      — Player demands their own release (1 lifetime demand)
   /grant_extra_demand  — [Owner IDs only] Give a player an extra demand token
   /promote_coach       — [HC/Staff] Promote a player to AHC
   /demote_coach        — [HC/Staff] Demote the AHC back to player
@@ -68,6 +83,7 @@ DATABASE_URL        = os.getenv("DATABASE_URL", "")   # set by Railway PostgreSQ
 
 UFF_THUMBNAIL  = os.getenv("UFF_THUMBNAIL_URL", "")
 UFF_BANNER     = os.getenv("UFF_BANNER_URL",    "")
+ZEVORA_LOGO_URL = os.getenv("ZEVORA_LOGO_URL",  "")   # league logo — used by /coaches and as a fallback thumbnail
 
 # Channel where ALL transactions (signings, releases, demands, etc.) are posted
 TRANSACTIONS_CHANNEL_ID = 1262200420151984152
@@ -111,11 +127,13 @@ PICKUP_ALLOWED_ROLE_IDS = {
 
 # Staff roles that can run ANY transaction on ANY team
 STAFF_ROLE_IDS = {
-    1404271074623099040,  # Moderators
     1404271002241728617,  # League Boards
     1429344923865448550,  # Operations Director
     1262200419686285342,  # Commissioner
     1401450124424642561,  # Founder
+    1499141732108079225,  # Co-Founder
+    1434653599236882574,  # Zevora
+    1502941495722770472,  # Advisory
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -498,11 +516,14 @@ def _info_block(team: dict) -> str:
 
 
 def _set_team_thumbnail(embed: discord.Embed, team: dict, guild: discord.Guild):
-    """Set thumbnail to team logo (inside the embed). Falls back to guild icon."""
+    """Set thumbnail to team logo (inside the embed). Falls back to the league
+    logo (ZEVORA_LOGO_URL), then the guild icon, so a thumbnail is always shown."""
     logo = team.get("logo_url", "")
-    if logo:
+    if logo and logo.startswith("http"):
         embed.set_thumbnail(url=logo)
-    elif guild.icon:
+    elif ZEVORA_LOGO_URL:
+        embed.set_thumbnail(url=ZEVORA_LOGO_URL)
+    elif guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
 
 
@@ -620,13 +641,19 @@ async def post_transaction(guild: discord.Guild, team: dict, embed: discord.Embe
                             ephemeral_msg="", ephemeral: bool = True):
     """
     Post transaction embed to the shared transactions channel.
-    Logo is already set as the embed thumbnail — no plain message needed.
+    Logo is already set as the embed thumbnail — no plain message needed for that.
+
+    The team role ping is sent as its own plain-text message AFTER the embed, so the
+    player headshot / embed shows first and the role ping (which actually triggers a
+    notification) follows it, outside the embed.
     """
     ch       = await get_transactions_channel(guild)
     ping_str = team_role.mention if team_role else ""
 
     if ch:
         await ch.send(embed=embed)
+        if ping_str:
+            await ch.send(content=ping_str)
         if followup and ephemeral_msg:
             await followup.send(ephemeral_msg, ephemeral=ephemeral)
         elif interaction and ephemeral_msg:
@@ -741,7 +768,11 @@ class OfferView(discord.ui.View):
 
         ch = await get_transactions_channel(guild)
         if ch:
+            # Headshot/embed posts first, then the team role ping as its own
+            # plain-text message AFTER it (outside the embed) so it actually notifies.
             await ch.send(embed=embed)
+            if team_role:
+                await ch.send(content=team_role.mention)
 
         accepted_embed = discord.Embed(
             title="✅ Offer Accepted!",
@@ -1175,6 +1206,7 @@ async def on_ready():
     print(f"   Suspension Channel   : {SUSPENSION_CHANNEL_ID}")
     print(f"   Bloxlink API         : {'set' if BLOXLINK_API_KEY else 'NOT SET — Roblox lookups disabled'}")
     print(f"   Database             : {'connected' if DATABASE_URL else 'NOT SET — add DATABASE_URL'}")
+    print(f"   Zevora League Logo   : {'set' if ZEVORA_LOGO_URL else 'NOT SET — falling back to guild icon'}")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1227,6 +1259,11 @@ async def set_team(interaction: discord.Interaction, team_role: discord.Role):
     )
     if logo_url:
         embed.set_thumbnail(url=logo_url)
+    else:
+        embed.description += (
+            "\n\n⚠️ No logo could be pulled from this role automatically (your server may not "
+            "have the role-icon feature unlocked). Use `/set_team_image` to set one manually."
+        )
     embed.set_footer(text=UFF_FOOTER)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1354,6 +1391,8 @@ async def offer(interaction: discord.Interaction, player: discord.Member):
     dm_embed.add_field(name="\u200b", value="you have **12 hours** to accept or ignore this offer", inline=False)
     if team_logo:
         dm_embed.set_thumbnail(url=team_logo)
+    elif ZEVORA_LOGO_URL:
+        dm_embed.set_thumbnail(url=ZEVORA_LOGO_URL)
     elif interaction.guild.icon:
         dm_embed.set_thumbnail(url=interaction.guild.icon.url)
     dm_embed.set_footer(text=UFF_FOOTER)
@@ -1405,7 +1444,7 @@ async def release(interaction: discord.Interaction, player: discord.Member):
             f"❌ {player.display_name} isn't on **{team['name']}**.", ephemeral=True); return
 
     await save_data(data)
-    await interaction.response.defer(ephemeral=False, thinking=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     team_role = get_team_role(interaction.guild, rid)
     # Remove the team Discord role from the released player
@@ -1421,10 +1460,10 @@ async def release(interaction: discord.Interaction, player: discord.Member):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /demand_release
+# /demand
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="demand_release", description="Demand your own release from your current team")
-async def demand_release(interaction: discord.Interaction):
+@bot.tree.command(name="demand", description="Demand from your current team 1 demand per player")
+async def demand(interaction: discord.Interaction):
     data = await load_data()
     uid  = str(interaction.user.id)
 
@@ -1442,7 +1481,7 @@ async def demand_release(interaction: discord.Interaction):
 
     if demand_used.get(uid, False) and extra_tokens <= 0:
         await interaction.response.send_message(
-            "❌ You've already used your demand release. Players are granted **1 demand release** only.\n"
+            "❌ You've already used your demand release. Players are granted **1 demand ** only.\n"
             "If you paid for an extra demand, ask a league admin to grant it with `/grant_extra_demand`.",
             ephemeral=True); return
 
@@ -1454,7 +1493,7 @@ async def demand_release(interaction: discord.Interaction):
     found_team["roster"] = [r for r in found_team.get("roster", []) if r["id"] != uid]
     await save_data(data)
 
-    await interaction.response.defer(ephemeral=False, thinking=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     blox          = await bloxlink_lookup(interaction.user.id, interaction.guild.id)
     roblox_name   = blox.get("roblox_username", "Unknown")
@@ -1483,7 +1522,7 @@ async def demand_release(interaction: discord.Interaction):
     embed.timestamp = datetime.utcnow()
 
     await post_transaction(interaction.guild, found_team, embed, team_role, followup=interaction.followup,
-                           ephemeral_msg=f"✅ Your demand release from **{found_team['name']}** has been posted.")
+                           ephemeral_msg=f"✅ You have demanded from **{found_team['name']}** This will be posted in transactions channel.")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1674,7 +1713,12 @@ async def disband(interaction: discord.Interaction, confirm: str, team_role: dis
         await interaction.response.send_message(
             f"✅ **{team_name}** has been disbanded. Posted to {ch.mention}.", ephemeral=True)
     else:
-        await interaction.response.send_message(embed=embed)
+        # No transactions channel configured — keep the actual announcement public in the
+        # current channel, but the ack to the command runner stays ephemeral.
+        await interaction.response.send_message(
+            f"✅ **{team_name}** has been disbanded. (No transactions channel configured — posting here.)",
+            ephemeral=True)
+        await interaction.channel.send(embed=embed)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1722,11 +1766,11 @@ async def roster_cmd(interaction: discord.Interaction, team_role: discord.Role):
     _set_team_thumbnail(embed, team, interaction.guild)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /coaches  — shows team logo thumbnail per team entry
+# /coaches  — single vertical list, league logo (Zevora) as thumbnail
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="coaches", description="View all head coaches across the league")
 async def coaches_cmd(interaction: discord.Interaction):
@@ -1742,7 +1786,6 @@ async def coaches_cmd(interaction: discord.Interaction):
             hc_id   = team.get("head_coach_id")
             hc_name = team.get("head_coach_name", "")
             hc_rbx  = team.get("head_coach_roblox", "")
-            logo    = team.get("logo_url", "")
 
             if hc_id:
                 hc_rbx_str = f"`{hc_rbx}`" if hc_rbx else ""
@@ -1753,21 +1796,29 @@ async def coaches_cmd(interaction: discord.Interaction):
             team_role    = get_team_role(interaction.guild, rid)
             role_mention = team_role.mention if team_role else team["name"]
 
-            # Include the logo as an emoji-style tag in the line if available
-            logo_tag = f" " if not logo else ""
-            lines.append(f"{role_mention} {logo_tag}— {hc_str}")
+            lines.append(f"{role_mention} — {hc_str}")
 
-        half  = (len(lines) + 1) // 2
-        left  = "\n".join(lines[:half])
-        right = "\n".join(lines[half:])
-        embed.add_field(name="\u200b", value=left or "*None*", inline=True)
-        if right:
-            embed.add_field(name="\u200b", value=right, inline=True)
+        # Single vertical list — chunk into multiple full-width fields if it would
+        # exceed Discord's 1024-char field limit, but never split into side-by-side columns.
+        chunks, current = [], ""
+        for line in lines:
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > 1000:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        if not chunks:
+            chunks = ["*None*"]
 
-    # Use the first registered team's logo as thumbnail, or fall back to guild icon
-    first_logo = next((t.get("logo_url") for t in teams.values() if t.get("logo_url")), "")
-    if first_logo:
-        embed.set_thumbnail(url=first_logo)
+        for chunk in chunks:
+            embed.add_field(name="\u200b", value=chunk, inline=False)
+
+    # League logo (Zevora) as thumbnail — not a team logo
+    if ZEVORA_LOGO_URL:
+        embed.set_thumbnail(url=ZEVORA_LOGO_URL)
     elif UFF_THUMBNAIL:
         embed.set_thumbnail(url=UFF_THUMBNAIL)
     elif interaction.guild.icon:
@@ -1775,7 +1826,7 @@ async def coaches_cmd(interaction: discord.Interaction):
 
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1925,12 +1976,12 @@ async def pickup_results(interaction: discord.Interaction, winner: discord.Membe
     embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}")
     embed.timestamp = datetime.utcnow()
 
+    # Ephemeral ack to whoever ran the command, but the actual results are always
+    # posted publicly — to the configured pickup channel if set, otherwise the current channel.
     ch = await get_pickup_channel(interaction.guild)
-    if ch and ch.id != interaction.channel_id:
-        await interaction.response.send_message("✅ Results posted!", ephemeral=True)
-        await ch.send(embed=embed)
-    else:
-        await interaction.response.send_message(embed=embed)
+    target_channel = ch if (ch and ch.id != interaction.channel_id) else interaction.channel
+    await interaction.response.send_message("✅ Results posted!", ephemeral=True)
+    await target_channel.send(embed=embed)
 
 
 @bot.tree.command(name="pickup_profile", description="View UFF pickup rank and stats")
@@ -1953,7 +2004,7 @@ async def pickup_profile(interaction: discord.Interaction, player: discord.Membe
     if target.avatar: embed.set_thumbnail(url=target.avatar.url)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="pickup_leaderboard", description="UFF pickup ELO leaderboard")
@@ -1974,7 +2025,7 @@ async def pickup_leaderboard(interaction: discord.Interaction):
     apply_branding(embed)
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="match_history", description="View recent UFF pickup results")
@@ -1990,7 +2041,7 @@ async def match_history(interaction: discord.Interaction):
     embed = discord.Embed(title="📋 UFF Pickup — Recent Results", description="\n".join(lines), color=0x4090E8)
     embed.set_footer(text=f"{UFF_FOOTER} • Last 10 matches")
     embed.timestamp = datetime.utcnow()
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="teams", description="View all 20 UFF league teams")
@@ -2000,7 +2051,7 @@ async def teams_cmd(interaction: discord.Interaction):
     embed.add_field(name="Teams 11–20", value="\n".join(f"`{t[1]}` **{t[0]}**" for t in TEAMS[10:]), inline=True)
     apply_branding(embed)
     embed.set_footer(text=f"{UFF_FOOTER} • 20 teams")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2138,7 +2189,7 @@ async def help_uff(interaction: discord.Interaction):
     ), inline=False)
     apply_branding(embed)
     embed.set_footer(text=f"{UFF_FOOTER} • {COOLDOWN_MINUTES}-min ranked cooldown")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
