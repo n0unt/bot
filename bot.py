@@ -6,18 +6,20 @@ TRANSACTIONS FLOW:
   /set_team       — [Staff] Register a Discord role as a UFF team, assign transaction channel
   /set_team_image — [Staff] Set the team logo URL for a team role
   /assign_hc      — [Staff] Assign a head coach to a team
-  /sign           — [HC/Staff] Sign a player to the team (posts transaction embed + Roblox avatar)
-  /release        — [HC/Staff] Release a player from the team
-  /demand_release — Player demands their own release
+  /offer          — [HC/AHC/Staff] Send a player a roster offer via DM (they accept or ignore, 12h window)
+  /grant_extra_demand — [Owner IDs only] Give a player an extra demand token
+  /release        — [HC/AHC/Staff] Release a player from the team
+  /demand_release — Player demands their own release (1 lifetime demand; extra grants via /grant_extra_demand)
   /promote_coach  — [HC/Staff] Promote a player to assistant head coach
   /demote_coach   — [HC/Staff] Demote the AHC back to player
+  /disband        — [HC/Staff] Remove all players and coaches from a team
   /roster         — [Public] View a team's roster
   /coaches        — [Public] View all head coaches across the league
 
 BLOXLINK:
   Requires BLOXLINK_API_KEY env var (get your key at blox.link/dashboard).
   The bot calls Bloxlink to resolve a Discord user → Roblox username + avatar.
-  If Bloxlink isn't set up yet the bot will note it gracefully in the embed.
+  Since everyone is verified, the Roblox username should always be available.
 
 PICKUP FLOW:
   1. /pickup_ranked  → challenger selects opponent + teams + game link
@@ -95,6 +97,18 @@ STAFF_ROLE_IDS = {
     1401450124424642561,  # Founder
 }
 
+# Head Coach role IDs (members with these roles are HCs)
+HEAD_COACH_ROLE_IDS = {
+    # Add your HC role ID(s) here, e.g.:
+    # 1234567890123456789,
+}
+
+# Assistant Head Coach role IDs
+AHC_ROLE_IDS = {
+    # Add your AHC role ID(s) here, e.g.:
+    # 9876543210987654321,
+}
+
 # ─────────────────────────────────────────────────────────────────────
 # SUSPENSIONS
 # ─────────────────────────────────────────────────────────────────────
@@ -136,6 +150,12 @@ SUSPENSION_REASONS = {
 
 SPECIAL_SUSPENSION_REASONS = {
     "ineligible_until_ss": "Ineligible Until Screenshare",
+}
+
+# User IDs allowed to grant extra demand tokens
+EXTRA_DEMAND_GRANT_USER_IDS = {
+    1055321446978691112,
+    391036854084042762,
 }
 
 
@@ -207,12 +227,18 @@ def load_data():
             "players": {}, "matches": [], "pending": {},
             "casual_pending": {}, "suspensions": [],
             "teams": {},        # role_id (str) -> team record
+            "demand_used": {},  # user_id (str) -> bool, tracks if they used their free demand
+            "extra_demands": {}, # user_id (str) -> int, extra demand tokens
+            "offers": {},        # offer_id -> offer record
         }
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
     data.setdefault("casual_pending", {})
     data.setdefault("suspensions", [])
     data.setdefault("teams", {})
+    data.setdefault("demand_used", {})
+    data.setdefault("extra_demands", {})
+    data.setdefault("offers", {})
     return data
 
 def save_data(data):
@@ -300,6 +326,12 @@ async def bloxlink_lookup(discord_id: int, guild_id: int) -> dict:
     Returns {"roblox_username": str, "roblox_id": int, "avatar_url": str}
     or {"error": str} if lookup fails.
     Requires BLOXLINK_API_KEY env var.
+
+    Get your API key at: https://blox.link/dashboard
+      1. Log in with Discord
+      2. Go to Dashboard → API Keys
+      3. Create a new key (free tier works)
+      4. Set it as BLOXLINK_API_KEY in your Railway environment variables
     """
     if not BLOXLINK_API_KEY:
         return {"error": "BLOXLINK_API_KEY not set in Railway environment variables."}
@@ -358,17 +390,49 @@ def get_team_for_hc(data: dict, user_id: int) -> tuple[str, dict] | tuple[None, 
             return role_id, team
     return None, None
 
+def get_team_for_ahc(data: dict, user_id: int) -> tuple[str, dict] | tuple[None, None]:
+    """Find which team (role_id, record) this user is assistant head coach of."""
+    uid = str(user_id)
+    for role_id, team in data["teams"].items():
+        if team.get("ahc_id") == uid:
+            return role_id, team
+    return None, None
+
+def get_team_for_user(data: dict, interaction: discord.Interaction) -> tuple[str, dict] | tuple[None, None]:
+    """
+    Auto-detect which team the interaction user manages.
+    Checks HC first, then AHC, then staff (staff must use team_role parameter instead).
+    Returns (role_id_str, team_dict) or (None, None).
+    """
+    uid = str(interaction.user.id)
+    # Check HC
+    for role_id, team in data["teams"].items():
+        if team.get("head_coach_id") == uid:
+            return role_id, team
+    # Check AHC
+    for role_id, team in data["teams"].items():
+        if team.get("ahc_id") == uid:
+            return role_id, team
+    return None, None
+
 def can_manage_team(interaction: discord.Interaction, team: dict) -> bool:
-    """Returns True if user is staff OR is the head coach of this specific team."""
+    """Returns True if user is staff OR is the head coach/AHC of this specific team."""
     if is_staff(interaction):
         return True
-    return team.get("head_coach_id") == str(interaction.user.id)
+    uid = str(interaction.user.id)
+    return team.get("head_coach_id") == uid or team.get("ahc_id") == uid
 
 async def get_transactions_channel(guild: discord.Guild, team: dict):
     ch_id = team.get("transactions_channel_id")
     if not ch_id:
         return None
     return await get_channel_safe(guild, int(ch_id))
+
+def get_team_role(guild: discord.Guild, role_id_str: str) -> discord.Role | None:
+    try:
+        return guild.get_role(int(role_id_str))
+    except (ValueError, TypeError):
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -384,7 +448,7 @@ def build_ranked_pickup_embed(
     r1, emoji1, _ = get_rank(e1)
     r2, emoji2, _ = get_rank(e2)
 
-    embed = discord.Embed(title="Ranked Pickup Matchup", color=UFF_COLOR)
+    embed = discord.Embed(title="ranked pickup matchup", color=UFF_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
         value=f"<@{challenger.id}>\n**{your_team}**\nRank: `{emoji1} {r1}`",
@@ -396,7 +460,7 @@ def build_ranked_pickup_embed(
         value=f"<@{opponent.id}>\n**{opponent_team}**\nRank: `{emoji2} {r2}`",
         inline=True
     )
-    embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
+    embed.add_field(name="🔗 game link", value=f"[**Click here to join →**]({game_link})", inline=False)
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
@@ -413,7 +477,7 @@ def build_casual_pickup_embed(
     challenger, opponent, your_team, opponent_team,
     game_link, guild, accepted=False
 ):
-    embed = discord.Embed(title="Casual Pickup Matchup", color=CASUAL_COLOR)
+    embed = discord.Embed(title="casual pickup matchup", color=CASUAL_COLOR)
     embed.add_field(
         name=f"🟡 {challenger.display_name}",
         value=f"<@{challenger.id}>\n**{your_team}**",
@@ -425,7 +489,7 @@ def build_casual_pickup_embed(
         value=f"<@{opponent.id}>\n**{opponent_team}**",
         inline=True
     )
-    embed.add_field(name="🔗 Game Link", value=f"[**Click here to join →**]({game_link})", inline=False)
+    embed.add_field(name="🔗 game link", value=f"[**Click here to join →**]({game_link})", inline=False)
     if UFF_BANNER:
         embed.set_image(url=UFF_BANNER)
     if UFF_THUMBNAIL:
@@ -448,12 +512,11 @@ async def build_transaction_embed(
     color: int = UFF_COLOR
 ) -> discord.Embed:
     """
-    Builds a rich transaction embed.
-    - action: e.g. "signed", "released", "promoted to Assistant Head Coach"
-    - Fetches Roblox avatar via Bloxlink and composites with team logo
+    Builds a rich transaction embed with lowercase title.
+    - action: e.g. "signed", "released", "promoted to assistant head coach"
     - Team logo shows as thumbnail; Roblox avatar headshot shows as main image
     """
-    embed = discord.Embed(title=action.upper(), color=color)
+    embed = discord.Embed(title=action.lower(), color=color)
 
     roster_size = len(team.get("roster", []))
 
@@ -463,9 +526,7 @@ async def build_transaction_embed(
     roblox_avatar   = blox.get("avatar_url", "")
     blox_error      = blox.get("error", "")
 
-    # Discord tag + Roblox username line (matching your screenshots)
-    discord_tag = f"@{player.name}" if hasattr(player, "name") else player.display_name
-    roblox_tag  = roblox_username if not blox_error else "Unknown"
+    roblox_tag = roblox_username if not blox_error else "Unknown"
 
     embed.description = (
         f"{team_role.mention} have **{action.lower()}** "
@@ -500,7 +561,7 @@ async def build_transaction_embed(
         for name, value in extra_fields:
             embed.add_field(name=name, value=value, inline=False)
 
-    # Team logo as thumbnail
+    # Team logo as thumbnail (use team logo_url, falls back to guild icon)
     team_logo = team.get("logo_url", "")
     if team_logo:
         embed.set_thumbnail(url=team_logo)
@@ -528,17 +589,20 @@ async def build_coach_transaction_embed(
     guild: discord.Guild,
     color: int = UFF_COLOR
 ) -> discord.Embed:
-    """Embed for coach promotions / demotions — no Roblox avatar, matches your screenshots."""
-    embed = discord.Embed(title=action.upper(), color=color)
+    """Embed for coach promotions / demotions — lowercase title."""
+    embed = discord.Embed(title=action.lower(), color=color)
 
     blox        = await bloxlink_lookup(player.id, guild.id)
     roblox_name = blox.get("roblox_username", "Unknown")
     roblox_avatar = blox.get("avatar_url", "")
 
+    is_promotion = "promot" in action.lower()
+    role_label = "assistant coach" if is_promotion else "regular player"
+
     embed.description = (
         f"{team_role.mention} have **{action.lower()}** "
         f"<@{player.id}> (@{player.name})\n"
-        f"`{roblox_name}` to {'assistant coach' if 'promot' in action.lower() else 'regular player'}!"
+        f"`{roblox_name}` to {role_label}!"
     )
 
     roster_size = len(team.get("roster", []))
@@ -661,6 +725,223 @@ async def _run_casual_pickup(interaction, opponent, game_link, your_team, oppone
     )
     confirm_embed.set_footer(text=f"{UFF_FOOTER} • 30-minute response window")
     await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OFFER VIEW  (replaces signed — player accepts/ignores within 12h)
+# ─────────────────────────────────────────────────────────────────────
+class OfferView(discord.ui.View):
+    def __init__(self, offer_id, team_role_id, team_name, team_logo,
+                 hc_id, hc_name, player_id, guild_id):
+        super().__init__(timeout=43200)  # 12 hours
+        self.offer_id     = offer_id
+        self.team_role_id = team_role_id
+        self.team_name    = team_name
+        self.team_logo    = team_logo
+        self.hc_id        = hc_id
+        self.hc_name      = hc_name
+        self.player_id    = player_id
+        self.guild_id     = guild_id
+        self.responded    = False
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        # Clean up the pending offer
+        data = load_data()
+        data.get("offers", {}).pop(self.offer_id, None)
+        save_data(data)
+
+    @discord.ui.button(label="✅  Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("❌ This offer isn't for you.", ephemeral=True)
+            return
+        if self.responded:
+            await interaction.response.send_message("This offer has already been answered.", ephemeral=True)
+            return
+        self.responded = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        data  = load_data()
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await interaction.response.send_message("❌ Could not find the server.", ephemeral=True)
+            return
+
+        # Fetch team and role
+        rid  = str(self.team_role_id)
+        team = data["teams"].get(rid)
+        if not team:
+            await interaction.response.edit_message(
+                content="❌ That team no longer exists.", view=self
+            )
+            return
+
+        # Check roster cap
+        roster = team.setdefault("roster", [])
+        if len(roster) >= MAX_ROSTER:
+            await interaction.response.edit_message(
+                content=f"❌ **{team['name']}** is at the roster cap ({MAX_ROSTER}/{MAX_ROSTER}). The offer can't be accepted.",
+                view=self
+            )
+            return
+
+        # Check not already on team
+        if str(interaction.user.id) in [r["id"] for r in roster]:
+            await interaction.response.edit_message(
+                content=f"❌ You're already on **{team['name']}**.",
+                view=self
+            )
+            return
+
+        try:
+            player = guild.get_member(self.player_id) or await guild.fetch_member(self.player_id)
+        except discord.NotFound:
+            await interaction.response.edit_message(content="❌ Could not find you in the server.", view=self)
+            return
+
+        # Bloxlink lookup
+        blox        = await bloxlink_lookup(player.id, guild.id)
+        roblox_name = blox.get("roblox_username", "Unknown")
+        roblox_avatar = blox.get("avatar_url", "")
+
+        # Add to roster
+        roster.append({
+            "id": str(player.id),
+            "name": player.display_name,
+            "roblox": roblox_name,
+            "role": "Player"
+        })
+
+        # Remove offer
+        data.get("offers", {}).pop(self.offer_id, None)
+        save_data(data)
+
+        # Get team role for mention
+        team_role = guild.get_role(int(rid))
+
+        # Build transaction embed
+        color = team.get("color", UFF_COLOR)
+        embed = discord.Embed(title="signed", color=color)
+        embed.description = (
+            f"{team_role.mention if team_role else team['name']} have **signed** "
+            f"<@{player.id}> (@{player.name})\n"
+            f"`{roblox_name}`"
+        )
+
+        roster_size = len(team.get("roster", []))
+        hc_id   = team.get("head_coach_id")
+        hc_name_v = team.get("head_coach_name", "vacant")
+        hc_rbx  = team.get("head_coach_roblox", "")
+        ahc_id  = team.get("ahc_id")
+        ahc_name_v = team.get("ahc_name", "vacant")
+        ahc_rbx = team.get("ahc_roblox", "")
+
+        info_lines = [f"roster: {roster_size}/{MAX_ROSTER}"]
+        if hc_id:
+            hc_rbx_str = f"`{hc_rbx}`" if hc_rbx else ""
+            info_lines.append(f"head coach: <@{hc_id}> (@{hc_name_v}) ✓ {hc_rbx_str}")
+        else:
+            info_lines.append("head coach: vacant")
+        if ahc_id:
+            ahc_rbx_str = f"`{ahc_rbx}`" if ahc_rbx else ""
+            info_lines.append(f"assistant coach: <@{ahc_id}> (@{ahc_name_v}) ✓ {ahc_rbx_str}")
+        else:
+            info_lines.append("assistant coach: vacant")
+        embed.add_field(name="\u200b", value="\n".join(info_lines), inline=False)
+
+        team_logo = team.get("logo_url", "")
+        if team_logo:
+            embed.set_thumbnail(url=team_logo)
+        elif guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        if roblox_avatar:
+            embed.set_image(url=roblox_avatar)
+
+        embed.set_footer(text=UFF_FOOTER)
+        embed.timestamp = datetime.utcnow()
+
+        # Post to transactions channel; also ping the team role
+        ch = await get_transactions_channel(guild, team)
+        ping_content = f"{team_role.mention}" if team_role else ""
+        if ch:
+            await ch.send(content=ping_content, embed=embed)
+
+        # Update DM
+        accepted_embed = discord.Embed(
+            title="✅ Offer Accepted!",
+            description=f"You accepted the offer from **{self.team_name}**!\n\nWelcome to the team.",
+            color=0x57F287
+        )
+        if self.team_logo:
+            accepted_embed.set_thumbnail(url=self.team_logo)
+        accepted_embed.set_footer(text=UFF_FOOTER)
+        await interaction.response.edit_message(embed=accepted_embed, view=self)
+
+        # Notify HC
+        if self.hc_id:
+            try:
+                hc_member = guild.get_member(int(self.hc_id)) or await guild.fetch_member(int(self.hc_id))
+                notify = discord.Embed(
+                    title="✅ Offer Accepted",
+                    description=f"**{player.display_name}** accepted your offer to join **{self.team_name}**.",
+                    color=0x57F287
+                )
+                notify.set_footer(text=UFF_FOOTER)
+                await hc_member.send(embed=notify)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="❌  Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("❌ This offer isn't for you.", ephemeral=True)
+            return
+        if self.responded:
+            await interaction.response.send_message("This offer has already been answered.", ephemeral=True)
+            return
+        self.responded = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        data = load_data()
+        data.get("offers", {}).pop(self.offer_id, None)
+        save_data(data)
+
+        declined_embed = discord.Embed(
+            title="❌ Offer Declined",
+            description=f"You declined the offer from **{self.team_name}**.",
+            color=0xED4245
+        )
+        if self.team_logo:
+            declined_embed.set_thumbnail(url=self.team_logo)
+        declined_embed.set_footer(text=UFF_FOOTER)
+        await interaction.response.edit_message(embed=declined_embed, view=self)
+
+        # Notify HC
+        guild = bot.get_guild(self.guild_id)
+        if guild and self.hc_id:
+            try:
+                hc_member = guild.get_member(int(self.hc_id)) or await guild.fetch_member(int(self.hc_id))
+                try:
+                    target = guild.get_member(self.player_id) or await guild.fetch_member(self.player_id)
+                    target_name = target.display_name
+                except Exception:
+                    target_name = "The player"
+                notify = discord.Embed(
+                    title="❌ Offer Declined",
+                    description=f"**{target_name}** declined your offer to join **{self.team_name}**.",
+                    color=0xED4245
+                )
+                notify.set_footer(text=UFF_FOOTER)
+                await hc_member.send(embed=notify)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -896,7 +1177,7 @@ class SuspensionConfirmButton(discord.ui.Button):
             await interaction.response.send_message("❌ Select at least one reason before confirming.", ephemeral=True); return
 
         total_games, reason_lines, status_lines = _build_suspension_summary(view.selected_reasons)
-        embed = discord.Embed(title="🚫 Player Suspension", color=0xED4245)
+        embed = discord.Embed(title="🚫 player suspension", color=0xED4245)
         embed.add_field(name="Player", value=f"<@{view.target.id}> ({view.target.display_name})", inline=False)
         if reason_lines: embed.add_field(name="Reason(s)", value=reason_lines, inline=False)
         if status_lines: embed.add_field(name="Additional Status", value=status_lines, inline=False)
@@ -988,14 +1269,16 @@ async def on_ready():
 @app_commands.describe(
     team_role="The Discord role that represents this team",
     team_name="Full team name (e.g. Columbus Colts)",
-    transactions_channel="Channel where transaction embeds will be posted"
+    transactions_channel="Channel where transaction embeds will be posted",
+    logo_url="Direct image URL for the team logo (optional — can also use /set_team_image)"
 )
 @app_commands.default_permissions(administrator=True)
 async def set_team(
     interaction: discord.Interaction,
     team_role: discord.Role,
     team_name: str,
-    transactions_channel: discord.TextChannel
+    transactions_channel: discord.TextChannel,
+    logo_url: str = ""
 ):
     if not is_staff(interaction):
         await interaction.response.send_message("❌ Staff only.", ephemeral=True); return
@@ -1014,16 +1297,21 @@ async def set_team(
         "ahc_id":                  existing.get("ahc_id"),
         "ahc_name":                existing.get("ahc_name"),
         "ahc_roblox":              existing.get("ahc_roblox", ""),
-        "logo_url":                existing.get("logo_url", ""),
+        "logo_url":                logo_url or existing.get("logo_url", ""),
         "roster":                  existing.get("roster", []),
         "color":                   team_role.color.value or UFF_COLOR,
     }
     save_data(data)
-    await interaction.response.send_message(
-        f"✅ **{team_name}** registered!\n"
-        f"Role: {team_role.mention} | Transactions → {transactions_channel.mention}",
-        ephemeral=True
+
+    embed = discord.Embed(title="team registered", color=UFF_COLOR)
+    embed.description = (
+        f"**{team_name}** is now registered!\n"
+        f"Role: {team_role.mention} | Transactions → {transactions_channel.mention}"
     )
+    if logo_url:
+        embed.set_thumbnail(url=logo_url)
+    embed.set_footer(text=UFF_FOOTER)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1052,7 +1340,7 @@ async def set_team_image(
 
     data["teams"][rid]["logo_url"] = logo_url
     save_data(data)
-    embed = discord.Embed(title="✅ Team Logo Updated", color=UFF_COLOR)
+    embed = discord.Embed(title="team logo updated", color=UFF_COLOR)
     embed.set_thumbnail(url=logo_url)
     embed.description = f"Logo for **{data['teams'][rid]['name']}** updated."
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1109,94 +1397,164 @@ async def assign_hc(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /sign  — HC (own team) or Staff (any team)
+# /offer  — HC or AHC (auto-detects team from DB) or Staff (picks any team)
+#           Sends a DM offer to the player; signing only happens if they accept
 # ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="sign", description="Sign a player to your team")
+@bot.tree.command(name="offer", description="Send a player a roster offer via DM (they must accept)")
 @app_commands.describe(
-    team_role="The team signing the player",
-    player="The player to sign"
+    player="The player to offer a roster spot to",
+    team_role="(Staff only) The team making the offer — HCs/AHCs don't need this"
 )
-async def sign(
+async def offer(
     interaction: discord.Interaction,
-    team_role: discord.Role,
-    player: discord.Member
+    player: discord.Member,
+    team_role: discord.Role = None
 ):
     data = load_data()
-    rid  = str(team_role.id)
-    team = get_team_by_role(data, team_role.id)
 
-    if not team:
-        await interaction.response.send_message(
-            f"❌ {team_role.mention} isn't registered. Ask staff to use `/set_team` first.", ephemeral=True
-        ); return
+    # Determine which team this person manages
+    if is_staff(interaction):
+        if team_role is None:
+            await interaction.response.send_message(
+                "❌ Staff must specify a `team_role` to make an offer on behalf of a team.", ephemeral=True
+            ); return
+        rid  = str(team_role.id)
+        team = get_team_by_role(data, team_role.id)
+        if not team:
+            await interaction.response.send_message(
+                f"❌ {team_role.mention} isn't registered. Use `/set_team` first.", ephemeral=True
+            ); return
+    else:
+        rid, team = get_team_for_user(data, interaction)
+        if not team:
+            await interaction.response.send_message(
+                "❌ You're not registered as a head coach or assistant coach of any team.", ephemeral=True
+            ); return
+        team_role = get_team_role(interaction.guild, rid)
 
-    if not can_manage_team(interaction, team):
-        await interaction.response.send_message(
-            "❌ You must be the head coach of this team or staff to sign players.", ephemeral=True
-        ); return
+    # Validate target
+    if player.id == interaction.user.id:
+        await interaction.response.send_message("❌ You can't offer yourself.", ephemeral=True); return
+    if player.bot:
+        await interaction.response.send_message("❌ Can't offer a bot.", ephemeral=True); return
 
+    # Check roster cap
     roster = team.setdefault("roster", [])
     if len(roster) >= MAX_ROSTER:
         await interaction.response.send_message(
             f"❌ **{team['name']}** is at the roster cap ({MAX_ROSTER}/{MAX_ROSTER}).", ephemeral=True
         ); return
 
+    # Already on team?
     if str(player.id) in [r["id"] for r in roster]:
         await interaction.response.send_message(
             f"❌ {player.display_name} is already on **{team['name']}**.", ephemeral=True
         ); return
 
-    await interaction.response.defer(ephemeral=False, thinking=True)
+    await interaction.response.defer(ephemeral=True)
 
-    blox        = await bloxlink_lookup(player.id, interaction.guild.id)
-    roblox_name = blox.get("roblox_username", "Unknown")
+    # Build offer DM embed
+    hc_id    = team.get("head_coach_id")
+    hc_name  = team.get("head_coach_name", "")
+    team_logo = team.get("logo_url", "")
+    team_name = team["name"]
+    team_color = team.get("color", UFF_COLOR)
 
-    roster.append({"id": str(player.id), "name": player.display_name,
-                   "roblox": roblox_name, "role": "Player"})
+    offer_id = f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
+    data.setdefault("offers", {})[offer_id] = {
+        "team_role_id": rid,
+        "team_name":    team_name,
+        "player_id":    str(player.id),
+        "hc_id":        hc_id,
+        "timestamp":    datetime.utcnow().isoformat(),
+        "guild_id":     str(interaction.guild.id),
+    }
     save_data(data)
 
-    embed = await build_transaction_embed(
-        action="signed",
-        player=player,
-        team=team,
-        team_role=team_role,
-        guild=interaction.guild,
-        color=team.get("color", UFF_COLOR)
+    # DM embed — matches the screenshot style
+    dm_embed = discord.Embed(
+        title=f"offer from the {team_name}",
+        description=f"you have been offered a roster spot on the **{team_name}**!",
+        color=team_color
     )
 
-    ch = await get_transactions_channel(interaction.guild, team)
-    if ch:
-        await ch.send(embed=embed)
-        await interaction.followup.send(f"✅ Signed **{player.display_name}** to **{team['name']}**. Posted to {ch.mention}.", ephemeral=True)
+    # Head coach line
+    hc_line = ""
+    if hc_id:
+        hc_rbx = team.get("head_coach_roblox", "")
+        hc_rbx_str = f"`{hc_rbx}`" if hc_rbx else ""
+        hc_line = f"<@{hc_id}> {hc_rbx_str}"
     else:
-        await interaction.followup.send(embed=embed)
+        hc_line = "*vacant*"
+    dm_embed.add_field(name="head coach:", value=hc_line, inline=False)
+    dm_embed.add_field(name="\u200b", value="you have **12 hours** to accept or ignore this offer", inline=False)
+
+    if team_logo:
+        dm_embed.set_thumbnail(url=team_logo)
+    elif interaction.guild.icon:
+        dm_embed.set_thumbnail(url=interaction.guild.icon.url)
+
+    dm_embed.set_footer(text=UFF_FOOTER)
+    dm_embed.timestamp = datetime.utcnow()
+
+    view = OfferView(
+        offer_id=offer_id,
+        team_role_id=int(rid),
+        team_name=team_name,
+        team_logo=team_logo,
+        hc_id=hc_id,
+        hc_name=hc_name,
+        player_id=player.id,
+        guild_id=interaction.guild.id,
+    )
+
+    try:
+        await player.send(embed=dm_embed, view=view)
+    except discord.Forbidden:
+        data.get("offers", {}).pop(offer_id, None)
+        save_data(data)
+        await interaction.followup.send(
+            f"❌ Could not DM **{player.display_name}** — they have DMs disabled.", ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ Offer sent to **{player.display_name}** via DM. They have 12 hours to accept or ignore.",
+        ephemeral=True
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /release  — HC (own team) or Staff (any team)
+# /release  — HC/AHC (own team, auto-detected) or Staff (any team)
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="release", description="Release a player from your team")
 @app_commands.describe(
-    team_role="The team releasing the player",
-    player="The player to release"
+    player="The player to release",
+    team_role="(Staff only) The team — HCs/AHCs don't need this"
 )
 async def release(
     interaction: discord.Interaction,
-    team_role: discord.Role,
-    player: discord.Member
+    player: discord.Member,
+    team_role: discord.Role = None
 ):
     data = load_data()
-    team = get_team_by_role(data, team_role.id)
 
-    if not team:
-        await interaction.response.send_message(
-            f"❌ {team_role.mention} isn't registered.", ephemeral=True
-        ); return
-
-    if not can_manage_team(interaction, team):
-        await interaction.response.send_message(
-            "❌ You must be the head coach of this team or staff to release players.", ephemeral=True
-        ); return
+    if is_staff(interaction):
+        if team_role is None:
+            await interaction.response.send_message(
+                "❌ Staff must specify a `team_role` to release from.", ephemeral=True
+            ); return
+        rid  = str(team_role.id)
+        team = get_team_by_role(data, team_role.id)
+        if not team:
+            await interaction.response.send_message(f"❌ {team_role.mention} isn't registered.", ephemeral=True); return
+    else:
+        rid, team = get_team_for_user(data, interaction)
+        if not team:
+            await interaction.response.send_message(
+                "❌ You're not registered as head coach or assistant coach of any team.", ephemeral=True
+            ); return
+        team_role = get_team_role(interaction.guild, rid)
 
     roster = team.setdefault("roster", [])
     before = len(roster)
@@ -1218,16 +1576,18 @@ async def release(
         color=0xED4245
     )
 
+    # Ping team role on release
+    ping_content = f"{team_role.mention}" if team_role else ""
     ch = await get_transactions_channel(interaction.guild, team)
     if ch:
-        await ch.send(embed=embed)
+        await ch.send(content=ping_content, embed=embed)
         await interaction.followup.send(f"✅ Released **{player.display_name}** from **{team['name']}**.", ephemeral=True)
     else:
         await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /demand_release  — Any player can use for themselves
+# /demand_release  — Any player can use (1 lifetime; extra via /grant_extra_demand)
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="demand_release", description="Demand your own release from your current team")
 @app_commands.describe(team_role="The team you want to leave")
@@ -1236,6 +1596,7 @@ async def demand_release(
     team_role: discord.Role
 ):
     data = load_data()
+    uid  = str(interaction.user.id)
     team = get_team_by_role(data, team_role.id)
 
     if not team:
@@ -1244,21 +1605,43 @@ async def demand_release(
         ); return
 
     roster = team.setdefault("roster", [])
-    if str(interaction.user.id) not in [r["id"] for r in roster]:
+    if uid not in [r["id"] for r in roster]:
         await interaction.response.send_message(
             f"❌ You aren't on **{team['name']}**.", ephemeral=True
         ); return
 
-    team["roster"] = [r for r in roster if r["id"] != str(interaction.user.id)]
+    # Check demand tokens
+    demand_used    = data.get("demand_used", {})
+    extra_demands  = data.get("extra_demands", {})
+    extra_tokens   = extra_demands.get(uid, 0)
+
+    if demand_used.get(uid, False) and extra_tokens <= 0:
+        await interaction.response.send_message(
+            "❌ You've already used your demand release. Players are only granted **1 demand release**.\n"
+            "If you paid for an extra demand, ask a league admin to grant it with `/grant_extra_demand`.",
+            ephemeral=True
+        ); return
+
+    # Consume token
+    if demand_used.get(uid, False):
+        # Use an extra token
+        extra_demands[uid] = extra_tokens - 1
+        data["extra_demands"] = extra_demands
+    else:
+        # Use their free demand
+        data.setdefault("demand_used", {})[uid] = True
+
+    # Remove from roster
+    team["roster"] = [r for r in roster if r["id"] != uid]
     save_data(data)
 
     await interaction.response.defer(ephemeral=False, thinking=True)
 
-    blox        = await bloxlink_lookup(interaction.user.id, interaction.guild.id)
-    roblox_name = blox.get("roblox_username", "Unknown")
+    blox          = await bloxlink_lookup(interaction.user.id, interaction.guild.id)
+    roblox_name   = blox.get("roblox_username", "Unknown")
     roblox_avatar = blox.get("avatar_url", "")
 
-    embed = discord.Embed(title="DEMAND RELEASE", color=0xED4245)
+    embed = discord.Embed(title="demand release", color=0xED4245)
     embed.description = (
         f"<@{interaction.user.id}> (@{interaction.user.name}) `{roblox_name}` "
         f"has demanded a release from the {team_role.mention}!"
@@ -1290,9 +1673,11 @@ async def demand_release(
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
 
+    # Ping team role
+    ping_content = f"{team_role.mention}" if team_role else ""
     ch = await get_transactions_channel(interaction.guild, team)
     if ch:
-        await ch.send(embed=embed)
+        await ch.send(content=ping_content, embed=embed)
         await interaction.followup.send(
             f"✅ Your demand release from **{team['name']}** has been posted to {ch.mention}.", ephemeral=True
         )
@@ -1301,35 +1686,73 @@ async def demand_release(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /promote_coach  — HC (own team) or Staff (any team)
+# /grant_extra_demand  — Owner IDs only
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="grant_extra_demand", description="[Owner] Grant a player an extra demand release token")
+@app_commands.describe(
+    player="The player to grant an extra demand to",
+    amount="Number of extra demands to grant (default 1)"
+)
+async def grant_extra_demand(
+    interaction: discord.Interaction,
+    player: discord.Member,
+    amount: int = 1
+):
+    if interaction.user.id not in EXTRA_DEMAND_GRANT_USER_IDS and not is_admin(interaction):
+        await interaction.response.send_message("❌ You don't have permission to grant extra demands.", ephemeral=True)
+        return
+
+    data = load_data()
+    uid  = str(player.id)
+    data.setdefault("extra_demands", {})
+    data["extra_demands"][uid] = data["extra_demands"].get(uid, 0) + amount
+    save_data(data)
+
+    total = data["extra_demands"][uid]
+    await interaction.response.send_message(
+        f"✅ Granted **{amount}** extra demand token(s) to **{player.display_name}**.\n"
+        f"They now have **{total}** extra demand token(s) banked.",
+        ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /promote_coach  — HC (own team, auto-detected) or Staff (any team)
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="promote_coach", description="Promote a player to Assistant Head Coach")
 @app_commands.describe(
-    team_role="The team role",
-    player="The player to promote to AHC"
+    player="The player to promote to AHC",
+    team_role="(Staff only) The team role — HCs don't need this"
 )
 async def promote_coach(
     interaction: discord.Interaction,
-    team_role: discord.Role,
-    player: discord.Member
+    player: discord.Member,
+    team_role: discord.Role = None
 ):
     data = load_data()
-    team = get_team_by_role(data, team_role.id)
 
-    if not team:
-        await interaction.response.send_message(
-            f"❌ {team_role.mention} isn't registered.", ephemeral=True
-        ); return
-
-    if not can_manage_team(interaction, team):
-        await interaction.response.send_message(
-            "❌ You must be the head coach of this team or staff.", ephemeral=True
-        ); return
+    if is_staff(interaction):
+        if team_role is None:
+            await interaction.response.send_message(
+                "❌ Staff must specify a `team_role`.", ephemeral=True
+            ); return
+        rid  = str(team_role.id)
+        team = get_team_by_role(data, team_role.id)
+        if not team:
+            await interaction.response.send_message(f"❌ {team_role.mention} isn't registered.", ephemeral=True); return
+    else:
+        # Only HCs can promote coaches (not AHCs)
+        rid, team = get_team_for_hc(data, interaction.user.id)
+        if not team:
+            await interaction.response.send_message(
+                "❌ You're not registered as head coach of any team.", ephemeral=True
+            ); return
+        team_role = get_team_role(interaction.guild, rid)
 
     roster = team.setdefault("roster", [])
     if str(player.id) not in [r["id"] for r in roster]:
         await interaction.response.send_message(
-            f"❌ {player.display_name} must be on the roster first. Use `/sign` to add them.", ephemeral=True
+            f"❌ {player.display_name} must be on the roster first. Use `/offer` to add them.", ephemeral=True
         ); return
 
     await interaction.response.defer(ephemeral=False, thinking=True)
@@ -1356,9 +1779,10 @@ async def promote_coach(
         color=team.get("color", UFF_COLOR)
     )
 
+    ping_content = f"{team_role.mention}" if team_role else ""
     ch = await get_transactions_channel(interaction.guild, team)
     if ch:
-        await ch.send(embed=embed)
+        await ch.send(content=ping_content, embed=embed)
         await interaction.followup.send(
             f"✅ **{player.display_name}** promoted to AHC of **{team['name']}**. Posted to {ch.mention}.", ephemeral=True
         )
@@ -1367,30 +1791,36 @@ async def promote_coach(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# /demote_coach  — HC (own team) or Staff (any team)
+# /demote_coach  — HC (own team, auto-detected) or Staff (any team)
 # ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="demote_coach", description="Demote the Assistant Head Coach back to player")
 @app_commands.describe(
-    team_role="The team role",
-    player="The AHC to demote"
+    player="The AHC to demote",
+    team_role="(Staff only) The team role — HCs don't need this"
 )
 async def demote_coach(
     interaction: discord.Interaction,
-    team_role: discord.Role,
-    player: discord.Member
+    player: discord.Member,
+    team_role: discord.Role = None
 ):
     data = load_data()
-    team = get_team_by_role(data, team_role.id)
 
-    if not team:
-        await interaction.response.send_message(
-            f"❌ {team_role.mention} isn't registered.", ephemeral=True
-        ); return
-
-    if not can_manage_team(interaction, team):
-        await interaction.response.send_message(
-            "❌ You must be the head coach of this team or staff.", ephemeral=True
-        ); return
+    if is_staff(interaction):
+        if team_role is None:
+            await interaction.response.send_message(
+                "❌ Staff must specify a `team_role`.", ephemeral=True
+            ); return
+        rid  = str(team_role.id)
+        team = get_team_by_role(data, team_role.id)
+        if not team:
+            await interaction.response.send_message(f"❌ {team_role.mention} isn't registered.", ephemeral=True); return
+    else:
+        rid, team = get_team_for_hc(data, interaction.user.id)
+        if not team:
+            await interaction.response.send_message(
+                "❌ You're not registered as head coach of any team.", ephemeral=True
+            ); return
+        team_role = get_team_role(interaction.guild, rid)
 
     if team.get("ahc_id") != str(player.id):
         await interaction.response.send_message(
@@ -1418,14 +1848,92 @@ async def demote_coach(
         color=0xED4245
     )
 
+    ping_content = f"{team_role.mention}" if team_role else ""
     ch = await get_transactions_channel(interaction.guild, team)
     if ch:
-        await ch.send(embed=embed)
+        await ch.send(content=ping_content, embed=embed)
         await interaction.followup.send(
             f"✅ **{player.display_name}** demoted from AHC of **{team['name']}**. Posted to {ch.mention}.", ephemeral=True
         )
     else:
         await interaction.followup.send(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# /disband  — HC (own team) or Staff (any team)
+#             Clears all players and coaches from the team
+# ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="disband", description="Disband a team — removes all players and coaches")
+@app_commands.describe(
+    team_role="(Staff only) The team to disband — HCs can omit this",
+    confirm="Type DISBAND to confirm"
+)
+async def disband(
+    interaction: discord.Interaction,
+    confirm: str,
+    team_role: discord.Role = None
+):
+    if confirm.upper() != "DISBAND":
+        await interaction.response.send_message(
+            '❌ You must type `DISBAND` exactly in the confirm field to confirm this action.', ephemeral=True
+        ); return
+
+    data = load_data()
+
+    if is_staff(interaction):
+        if team_role is None:
+            await interaction.response.send_message(
+                "❌ Staff must specify a `team_role` to disband.", ephemeral=True
+            ); return
+        rid  = str(team_role.id)
+        team = get_team_by_role(data, team_role.id)
+        if not team:
+            await interaction.response.send_message(f"❌ {team_role.mention} isn't registered.", ephemeral=True); return
+    else:
+        rid, team = get_team_for_hc(data, interaction.user.id)
+        if not team:
+            await interaction.response.send_message(
+                "❌ You're not registered as head coach of any team.", ephemeral=True
+            ); return
+        team_role = get_team_role(interaction.guild, rid)
+
+    team_name   = team["name"]
+    former_size = len(team.get("roster", []))
+
+    # Clear roster and coaching staff
+    team["roster"]           = []
+    team["head_coach_id"]    = None
+    team["head_coach_name"]  = None
+    team["head_coach_roblox"] = ""
+    team["ahc_id"]           = None
+    team["ahc_name"]         = None
+    team["ahc_roblox"]       = ""
+
+    save_data(data)
+
+    embed = discord.Embed(title="team disbanded", color=0xED4245)
+    embed.description = (
+        f"**{team_name}** has been disbanded.\n"
+        f"All **{former_size}** player(s) and coaches have been removed from the roster."
+    )
+    if team_role:
+        embed.add_field(name="Team", value=team_role.mention, inline=True)
+    team_logo = team.get("logo_url", "")
+    if team_logo:
+        embed.set_thumbnail(url=team_logo)
+    elif interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    embed.set_footer(text=f"Disbanded by {interaction.user.display_name} | {UFF_FOOTER}")
+    embed.timestamp = datetime.utcnow()
+
+    ch = await get_transactions_channel(interaction.guild, team)
+    if ch:
+        await ch.send(embed=embed)
+        await interaction.response.send_message(
+            f"✅ **{team_name}** has been disbanded. Posted to {ch.mention}.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(embed=embed)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1445,34 +1953,43 @@ async def roster_cmd(interaction: discord.Interaction, team_role: discord.Role):
     roster = team.get("roster", [])
     color  = team.get("color", UFF_COLOR)
     embed  = discord.Embed(
-        title=f"{team['name']} — Roster",
-        description=f"**{len(roster)}/{MAX_ROSTER}** players",
+        title=f"{team['name'].lower()} roster",
+        description=f"roster: **{len(roster)}/{MAX_ROSTER}**",
         color=color
     )
 
+    # Head coach line at top
+    hc_id  = team.get("head_coach_id")
+    hc_rbx = team.get("head_coach_roblox", "")
+    if hc_id:
+        hc_rbx_str = f"`{hc_rbx}`" if hc_rbx else ""
+        embed.add_field(
+            name="head coach:",
+            value=f"<@{hc_id}> (@{team.get('head_coach_name', '')}) ✓ {hc_rbx_str}",
+            inline=False
+        )
+
     if not roster:
-        embed.add_field(name="Players", value="*No players on roster yet.*", inline=False)
+        embed.add_field(name="players", value="*No players on roster yet.*", inline=False)
     else:
-        hc_lines  = []
         ahc_lines = []
         pl_lines  = []
         for r in roster:
             rbx = f"`{r['roblox']}`" if r.get("roblox") else ""
-            line = f"<@{r['id']}> {rbx}"
+            # Show: @discord (roblox_username) ✓ roblox_name
+            mention = f"<@{r['id']}>"
+            discord_at = f"(@{r['name']})"
+            line = f"{mention} {discord_at} ✓ {rbx}" if rbx else f"{mention} {discord_at}"
             role = r.get("role", "Player")
-            if role == "Head Coach":
-                hc_lines.append(f"👑 {line}")
-            elif role == "Assistant Head Coach":
+            if role == "Assistant Head Coach":
                 ahc_lines.append(f"🥈 {line}")
-            else:
+            elif role != "Head Coach":
                 pl_lines.append(f"• {line}")
 
-        if hc_lines:
-            embed.add_field(name="Head Coach", value="\n".join(hc_lines), inline=False)
         if ahc_lines:
-            embed.add_field(name="Assistant Head Coach", value="\n".join(ahc_lines), inline=False)
+            embed.add_field(name="assistant head coach:", value="\n".join(ahc_lines), inline=False)
         if pl_lines:
-            embed.add_field(name="Players", value="\n".join(pl_lines), inline=False)
+            embed.add_field(name="players:", value="\n".join(pl_lines), inline=False)
 
     logo = team.get("logo_url", "")
     if logo:
@@ -1493,7 +2010,7 @@ async def coaches_cmd(interaction: discord.Interaction):
     data  = load_data()
     teams = data.get("teams", {})
 
-    embed = discord.Embed(title="UFF — Head Coaches", color=UFF_COLOR)
+    embed = discord.Embed(title="head coaches", color=UFF_COLOR)
 
     if not teams:
         embed.description = "*No teams registered yet.*"
@@ -1503,30 +2020,36 @@ async def coaches_cmd(interaction: discord.Interaction):
             hc_id   = team.get("head_coach_id")
             hc_name = team.get("head_coach_name", "vacant")
             hc_rbx  = team.get("head_coach_roblox", "")
-            ahc_id  = team.get("ahc_id")
-            ahc_rbx = team.get("ahc_roblox", "")
 
             if hc_id:
-                hc_str = f"<@{hc_id}> `{hc_rbx}`" if hc_rbx else f"<@{hc_id}>"
+                hc_rbx_str = f"`{hc_rbx}`" if hc_rbx else ""
+                # Format: team emoji (if role) @discord (@discordname) ✓ roblox_name
+                hc_str = f"<@{hc_id}> (@{hc_name}) ✓ {hc_rbx_str}" if hc_rbx else f"<@{hc_id}> (@{hc_name})"
             else:
                 hc_str = "*vacant*"
 
             roster_size = len(team.get("roster", []))
-            line = f"**{team['name']}** ({roster_size}/{MAX_ROSTER})\n  👑 HC: {hc_str}"
+            # Get team role mention
+            team_role = get_team_role(interaction.guild, rid)
+            role_mention = team_role.mention if team_role else team["name"]
+            line = f"{role_mention} — {hc_str}"
+            lines.append((team["name"], line))
 
-            if ahc_id:
-                ahc_str = f"<@{ahc_id}> `{ahc_rbx}`" if ahc_rbx else f"<@{ahc_id}>"
-                line += f"\n  🥈 AHC: {ahc_str}"
-
-            lines.append(line)
-
-        # Split into two fields if there are many teams
+        # Split into two columns
         half = (len(lines) + 1) // 2
-        embed.add_field(name="Teams", value="\n\n".join(lines[:half]) or "*None*", inline=True)
-        if lines[half:]:
-            embed.add_field(name="\u200b", value="\n\n".join(lines[half:]), inline=True)
+        left  = "\n".join(l for _, l in lines[:half])
+        right = "\n".join(l for _, l in lines[half:])
 
-    apply_branding(embed)
+        embed.add_field(name="\u200b", value=left or "*None*", inline=True)
+        if right:
+            embed.add_field(name="\u200b", value=right, inline=True)
+
+    # Team logo goes here if we have a global UFF image
+    if UFF_THUMBNAIL:
+        embed.set_thumbnail(url=UFF_THUMBNAIL)
+    elif interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
     await interaction.response.send_message(embed=embed)
@@ -1564,7 +2087,7 @@ async def pickup_ranked(
     data = load_data()
     cd, remaining = on_cooldown(data, interaction.user.id)
     if cd:
-        e = discord.Embed(title="⏳ Cooldown Active",
+        e = discord.Embed(title="⏳ cooldown active",
             description=f"You can challenge again in **{remaining}**.\nCooldown: `{COOLDOWN_MINUTES} minutes`.",
             color=0xE84040)
         e.set_footer(text=UFF_FOOTER)
@@ -1693,7 +2216,7 @@ async def pickup_results(
     wr, we, wcolor = get_rank(w_elo)
     lr, le, _      = get_rank(l_elo)
 
-    embed = discord.Embed(title="🏆 Pickup Results", color=wcolor)
+    embed = discord.Embed(title="🏆 pickup results", color=wcolor)
     embed.add_field(name="🏆 Winner",
         value=f"<@{winner.id}> **{winner.display_name}**\n> Score: **{winner_score}**\n> ELO: `{old_w}` → `{w_elo}` **(+{WIN_ELO})**\n> Rank: `{we} {wr}`",
         inline=True)
@@ -1862,7 +2385,7 @@ async def unsuspend(interaction: discord.Interaction, player: discord.Member):
             s["cleared_date"] = datetime.utcnow().isoformat(); cleared_any = True
     save_data(data)
 
-    embed = discord.Embed(title="✅ Player Unsuspended", color=0x57F287)
+    embed = discord.Embed(title="player unsuspended", color=0x57F287)
     embed.add_field(name="Player", value=f"<@{player.id}> ({player.display_name})", inline=False)
     embed.add_field(name="Status", value="**Cleared** — eligible to play", inline=False)
     if player.avatar: embed.set_thumbnail(url=player.avatar.url)
@@ -1888,11 +2411,13 @@ async def help_uff(interaction: discord.Interaction):
         "`/set_team` — [Staff] Register a role as a team + set transactions channel\n"
         "`/set_team_image` — [Staff] Set the team logo URL\n"
         "`/assign_hc` — [Staff] Assign a head coach to a team\n"
-        "`/sign` — [HC/Staff] Sign a player to your team\n"
-        "`/release` — [HC/Staff] Release a player from your team\n"
-        "`/demand_release` — Demand your own release from a team\n"
+        "`/offer` — [HC/AHC/Staff] Send a player a DM roster offer (12h to accept)\n"
+        "`/release` — [HC/AHC/Staff] Release a player from your team\n"
+        "`/demand_release` — Demand your own release (1 free lifetime demand)\n"
+        "`/grant_extra_demand` — [Owner] Grant a player an extra demand token\n"
         "`/promote_coach` — [HC/Staff] Promote a player to Assistant Head Coach\n"
         "`/demote_coach` — [HC/Staff] Demote the AHC back to player\n"
+        "`/disband` — [HC/Staff] Disband a team (clears all players & coaches)\n"
         "`/roster` — View a team's roster\n"
         "`/coaches` — View all head coaches in the league"
     ), inline=False)
@@ -1911,7 +2436,7 @@ async def help_uff(interaction: discord.Interaction):
         "`/clear_cooldown` — Remove cooldown"
     ), inline=False)
     embed.add_field(name="🚫 Suspensions", value=(
-        f"`/suspension` — [Staff] Issue a suspension\n"
+        "`/suspension` — [Staff] Issue a suspension\n"
         "`/unsuspend` — [Staff] Clear a suspension"
     ), inline=False)
     embed.add_field(name="📊 Ranks", value=(
