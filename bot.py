@@ -13,7 +13,7 @@ CHANGES THIS VERSION:
   - /coaches shows: team_emoji role_mention — hc_info (single vertical list)
   - Bloxlink avatar fetch fixed
   - All non-public commands ephemeral
-  - Staff role updated
+  - Staff roles updated
 """
 
 import discord
