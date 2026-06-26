@@ -32,9 +32,19 @@ from discord import app_commands
 from discord.ext import commands
 import json
 import os
+import io
+import logging
 import aiohttp
 from datetime import datetime, timedelta
 import asyncpg
+
+try:
+    from PIL import Image, ImageDraw
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+log = logging.getLogger("zevora")
 
 TOKEN               = os.getenv("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OWNER_ID            = int(os.getenv("OWNER_DISCORD_ID", "0"))
@@ -128,7 +138,11 @@ _db_pool = None
 async def get_db():
     global _db_pool
     if _db_pool is None:
-        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not set")
+        _db_pool = await asyncpg.create_pool(
+            DATABASE_URL, min_size=1, max_size=5, timeout=10, command_timeout=10
+        )
     return _db_pool
 
 async def init_db():
@@ -228,42 +242,154 @@ async def get_susp_ch(guild):   return await get_ch(guild, SUSPENSION_CHANNEL_ID
 async def get_tx_ch(guild):     return await get_ch(guild, TRANSACTIONS_CHANNEL_ID)
 
 # ── BLOXLINK ──────────────────────────────────────────────────────────
+def _parse_bloxlink_body(body):
+    """Extract Roblox ID from Bloxlink v4 response shapes."""
+    if not isinstance(body, dict):
+        return None
+    rid = body.get("robloxID") or body.get("RobloxID") or body.get("robloxId")
+    if rid:
+        return str(rid)
+    resolved = body.get("resolved") or body.get("Resolved") or {}
+    roblox = resolved.get("roblox") or resolved.get("Roblox") or {}
+    rid = roblox.get("id") or roblox.get("Id")
+    return str(rid) if rid else None
+
+async def _fetch_json(session, url, headers):
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        if r.status != 200:
+            return None, f"HTTP {r.status}"
+        try:
+            return await r.json(), None
+        except Exception:
+            return None, "Invalid JSON"
+
 async def bloxlink_lookup(discord_id, guild_id):
     if not BLOXLINK_API_KEY:
         return {"error": "BLOXLINK_API_KEY not set"}
+    headers = {"Authorization": BLOXLINK_API_KEY}
+    urls = [
+        f"https://api.blox.link/v4/public/guilds/{guild_id}/discord-to-roblox/{discord_id}",
+        f"https://api.blox.link/v4/public/discord-to-roblox/{discord_id}",
+    ]
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"https://api.blox.link/v4/public/guilds/{guild_id}/discord-to-roblox/{discord_id}",
-                headers={"Authorization": BLOXLINK_API_KEY},
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as r:
-                if r.status != 200: return {"error": f"Bloxlink HTTP {r.status}"}
-                body = await r.json()
-        rid = body.get("robloxID")
-        if not rid: return {"error": "No Roblox account linked"}
+        async with aiohttp.ClientSession() as session:
+            rid = None
+            last_err = "No Roblox account linked"
+            for url in urls:
+                body, err = await _fetch_json(session, url, headers)
+                if err:
+                    last_err = err
+                    continue
+                rid = _parse_bloxlink_body(body)
+                if rid:
+                    break
+            if not rid:
+                return {"error": last_err}
 
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://users.roblox.com/v1/users/{rid}",
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                udata = await r.json() if r.status == 200 else {}
-        username = udata.get("name", str(rid))
+            body, err = await _fetch_json(session, f"https://users.roblox.com/v1/users/{rid}", {})
+            username = body.get("name", str(rid)) if body and not err else str(rid)
 
-        avatar_url = ""
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
+            avatar_url = ""
+            td, err = await _fetch_json(
+                session,
                 f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
                 f"?userIds={rid}&size=150x150&format=Png&isCircular=false",
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as r:
-                if r.status == 200:
-                    td = await r.json()
-                    items = td.get("data", [])
-                    avatar_url = items[0].get("imageUrl", "") if items else ""
+                {},
+            )
+            if td and not err:
+                items = td.get("data", [])
+                avatar_url = items[0].get("imageUrl", "") if items else ""
 
-        return {"roblox_username": username, "roblox_id": int(rid), "avatar_url": avatar_url}
+            return {
+                "roblox_username": username,
+                "roblox_id": int(rid),
+                "avatar_url": avatar_url,
+            }
     except Exception as e:
+        log.exception("Bloxlink lookup failed for %s", discord_id)
         return {"error": str(e)}
+
+async def _download_image(session, url):
+    if not url:
+        return None
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 200:
+                return await r.read()
+    except Exception:
+        pass
+    return None
+
+def _make_composite_png(avatar_bytes, logo_bytes, size=256):
+    """Half-circle avatar (left) + half-circle team logo (right), like astara."""
+    if not _PIL_OK:
+        return None
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+    logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+    avatar = avatar.resize((size, size), Image.Resampling.LANCZOS)
+    logo = logo.resize((size, size), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    half = size // 2
+    canvas.paste(avatar.crop((0, 0, half, size)), (0, 0))
+    canvas.paste(logo.crop((half, 0, size, size)), (half, 0))
+
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    canvas.putalpha(mask)
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+async def make_composite_file(avatar_url, logo_url):
+    if not avatar_url or not logo_url or not _PIL_OK:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            avatar_bytes = await _download_image(session, avatar_url)
+            logo_bytes = await _download_image(session, logo_url)
+        if not avatar_bytes or not logo_bytes:
+            return None
+        png = _make_composite_png(avatar_bytes, logo_bytes)
+        if not png:
+            return None
+        return discord.File(png, filename="composite.png")
+    except Exception:
+        log.exception("Composite thumbnail failed")
+        return None
+
+def _player_tx_line(player, blox):
+    rbx_id = blox.get("roblox_id")
+    if rbx_id:
+        return f"{player.mention} `{rbx_id}`"
+    rbx_name = blox.get("roblox_username")
+    if rbx_name and rbx_name != "Unknown":
+        return f"{player.mention} `{rbx_name}`"
+    return f"{player.mention} (@{player.name})"
+
+async def _apply_tx_images(embed, blox, team, guild):
+    """Set thumbnail (composite or fallback) and bottom team logo image."""
+    avatar_url = blox.get("avatar_url", "")
+    logo_url = team.get("logo_url", "")
+    composite = await make_composite_file(avatar_url, logo_url)
+    if composite:
+        embed.set_thumbnail(url="attachment://composite.png")
+        if logo_url:
+            embed.set_image(url=logo_url)
+        return composite
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+    elif logo_url:
+        embed.set_thumbnail(url=logo_url)
+    else:
+        lt = _league_thumb(guild)
+        if lt:
+            embed.set_thumbnail(url=lt)
+    if logo_url:
+        embed.set_image(url=logo_url)
+    return None
 
 # ── TEAM HELPERS ──────────────────────────────────────────────────────
 def get_team_by_role(data, role_id):
@@ -330,97 +456,88 @@ def _info_block(team):
         lines.append("> assistant coach: vacant")
     return "\n".join(lines)
 
-async def build_tx_embed(action, player, team, team_role, guild, color=UFF_COLOR):
+async def build_tx_embed(action, player, team, team_role, guild, color=UFF_COLOR, blox=None):
     """
-    Compact transaction embed:
-      - No title
-      - Description: {emoji}{team_ping} have **{action}** {player_ping} (@discordname)\n`roblox_name`\n\n{info_block}
-      - Thumbnail (top-right): Roblox headshot (falls back to team logo)
-      - Image (bottom): team logo
+    Compact transaction embed matching league style:
+      - Description includes player mention + Roblox ID
+      - Thumbnail: Roblox headshot + team logo composite (top-right)
+      - Image: team logo (bottom)
+    Returns (embed, optional discord.File for composite thumbnail).
     """
-    blox   = await bloxlink_lookup(player.id, guild.id)
-    rbx_name  = blox.get("roblox_username","Unknown")
-    rbx_avatar= blox.get("avatar_url","")
+    if blox is None:
+        blox = await bloxlink_lookup(player.id, guild.id)
 
-    emoji    = team.get("emoji","")
+    emoji = team.get("emoji", "")
     role_str = team_role.mention if team_role else f"**{team['name']}**"
-    prefix   = f"{emoji} " if emoji else ""
+    prefix = f"{emoji} " if emoji else ""
 
     embed = discord.Embed(
         description=(
-            f"{prefix}{role_str} have **{action.lower()}** {player.mention} (@{player.name})\n"
-            f"`{rbx_name}`\n\n"
+            f"{prefix}{role_str} have **{action.lower()}** {_player_tx_line(player, blox)}!\n\n"
             f"{_info_block(team)}"
         ),
         color=color,
     )
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
+    file = await _apply_tx_images(embed, blox, team, guild)
+    return embed, file
 
-    # Thumbnail = Roblox headshot (top-right corner)
-    if rbx_avatar:
-        embed.set_thumbnail(url=rbx_avatar)
-    elif team.get("logo_url"):
-        embed.set_thumbnail(url=team["logo_url"])
-    else:
-        lt = _league_thumb(guild)
-        if lt: embed.set_thumbnail(url=lt)
+async def build_coach_embed(action, player, team, team_role, guild, color=UFF_COLOR, blox=None):
+    if blox is None:
+        blox = await bloxlink_lookup(player.id, guild.id)
+    is_promo = "promot" in action.lower()
+    role_lbl = "assistant coach" if is_promo else "regular player"
 
-    # Image = team logo (bottom, badge-style)
-    if team.get("logo_url"):
-        embed.set_image(url=team["logo_url"])
-
-    return embed
-
-async def build_coach_embed(action, player, team, team_role, guild, color=UFF_COLOR):
-    blox   = await bloxlink_lookup(player.id, guild.id)
-    rbx_name  = blox.get("roblox_username","Unknown")
-    rbx_avatar= blox.get("avatar_url","")
-    is_promo  = "promot" in action.lower()
-    role_lbl  = "assistant coach" if is_promo else "regular player"
-
-    emoji    = team.get("emoji","")
+    emoji = team.get("emoji", "")
     role_str = team_role.mention if team_role else f"**{team['name']}**"
-    prefix   = f"{emoji} " if emoji else ""
+    prefix = f"{emoji} " if emoji else ""
 
     embed = discord.Embed(
         description=(
-            f"{prefix}{role_str} have **{action.lower()}** {player.mention} (@{player.name})\n"
-            f"`{rbx_name}` to {role_lbl}!\n\n"
+            f"{prefix}{role_str} have **{action.lower()}** {_player_tx_line(player, blox)} "
+            f"to {role_lbl}!\n\n"
             f"{_info_block(team)}"
         ),
         color=color,
     )
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
+    file = await _apply_tx_images(embed, blox, team, guild)
+    return embed, file
 
-    if rbx_avatar:
-        embed.set_thumbnail(url=rbx_avatar)
-    elif team.get("logo_url"):
-        embed.set_thumbnail(url=team["logo_url"])
-    else:
-        lt = _league_thumb(guild)
-        if lt: embed.set_thumbnail(url=lt)
-
-    if team.get("logo_url"):
-        embed.set_image(url=team["logo_url"])
-
-    return embed
-
-async def post_tx(guild, embed, followup=None, interaction=None, msg="", ephemeral=True):
+async def post_tx(guild, embed, followup=None, interaction=None, msg="", ephemeral=True, file=None):
     ch = await get_tx_ch(guild)
+    send_kwargs = {"embed": embed}
+    if file:
+        send_kwargs["file"] = file
     if ch:
-        await ch.send(embed=embed)
-        if followup and msg:   await followup.send(msg, ephemeral=ephemeral)
+        await ch.send(**send_kwargs)
+        if followup and msg:
+            await followup.send(msg, ephemeral=ephemeral)
         elif interaction and msg:
-            try:   await interaction.response.send_message(msg, ephemeral=ephemeral)
+            try:
+                await interaction.response.send_message(msg, ephemeral=ephemeral)
             except discord.InteractionResponded:
-                   await interaction.followup.send(msg, ephemeral=ephemeral)
+                await interaction.followup.send(msg, ephemeral=ephemeral)
     else:
         target = followup or interaction
         if target:
-            try:    await target.send(embed=embed)
-            except: await target.followup.send(embed=embed)
+            try:
+                await target.send(**send_kwargs)
+            except Exception:
+                await target.followup.send(**send_kwargs)
+
+async def _cmd_error(interaction, label, exc):
+    log.exception("%s failed", label)
+    text = f"❌ {label} failed: `{exc}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except Exception:
+        pass
 
 # ── OFFER VIEW ────────────────────────────────────────────────────────
 class OfferView(discord.ui.View):
@@ -467,7 +584,7 @@ class OfferView(discord.ui.View):
             await interaction.edit_original_response(content="❌ Couldn't find you in server.",view=self); return
 
         blox=await bloxlink_lookup(player.id,guild.id)
-        rbx_name=blox.get("roblox_username","Unknown"); rbx_avatar=blox.get("avatar_url","")
+        rbx_name=blox.get("roblox_username","Unknown")
 
         roster.append({"id":str(player.id),"name":player.display_name,"roblox":rbx_name,"role":"Player"})
         data.get("offers",{}).pop(self.offer_id,None); await save_data(data)
@@ -481,18 +598,30 @@ class OfferView(discord.ui.View):
 
         embed=discord.Embed(
             description=(
-                f"{prefix}{role_str} have **signed** {player.mention} (@{player.name})\n"
-                f"`{rbx_name}`\n\n{_info_block(team)}"
+                f"{prefix}{role_str} have **signed** {_player_tx_line(player, blox)}!\n\n"
+                f"{_info_block(team)}"
             ),
             color=team.get("color",UFF_COLOR),
         )
         embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-        if rbx_avatar: embed.set_thumbnail(url=rbx_avatar)
-        elif team.get("logo_url"): embed.set_thumbnail(url=team["logo_url"])
-        if team.get("logo_url"): embed.set_image(url=team["logo_url"])
+        composite = await make_composite_file(blox.get("avatar_url",""), team.get("logo_url",""))
+        if composite:
+            embed.set_thumbnail(url="attachment://composite.png")
+            if team.get("logo_url"):
+                embed.set_image(url=team["logo_url"])
+        elif blox.get("avatar_url"):
+            embed.set_thumbnail(url=blox["avatar_url"])
+        elif team.get("logo_url"):
+            embed.set_thumbnail(url=team["logo_url"])
+        if team.get("logo_url") and not embed.image:
+            embed.set_image(url=team["logo_url"])
 
         ch=await get_tx_ch(guild)
-        if ch: await ch.send(embed=embed)
+        if ch:
+            if composite:
+                await ch.send(embed=embed, file=composite)
+            else:
+                await ch.send(embed=embed)
 
         desc=f"You accepted the offer from **{self.team_name}**!\n\nWelcome to the team."
         if role_failed: desc+="\n\n⚠️ Team role couldn't be added automatically."
@@ -852,6 +981,19 @@ async def on_ready():
     print(f"   Bloxlink     : {'SET' if BLOXLINK_API_KEY else 'NOT SET'}")
     print(f"   Zevora Logo  : {'SET' if ZEVORA_LOGO_URL else 'NOT SET'}")
     print(f"   Database     : {'SET' if DATABASE_URL else 'NOT SET'}")
+    print(f"   Pillow       : {'OK' if _PIL_OK else 'MISSING — pip install Pillow for avatar+logo thumbnails'}")
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    log.exception("Slash command error: %s", error)
+    msg = f"❌ Command failed: `{error}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 # ══════════════════════════════════════════════════════════════════════
 # TRANSACTION COMMANDS
@@ -962,135 +1104,141 @@ async def assign_hc(interaction:discord.Interaction,team_role:discord.Role,playe
 @app_commands.describe(player="The player to offer a roster spot to")
 async def offer(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
-    data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
-    if not team:
-        msg="❌ Staff: assign yourself as HC first." if is_staff(interaction) else "❌ You're not HC or AHC of any team."
-        await interaction.followup.send(msg,ephemeral=True); return
-    if player.id==interaction.user.id:
-        await interaction.followup.send("❌ Can't offer yourself.",ephemeral=True); return
-    if player.bot:
-        await interaction.followup.send("❌ Can't offer a bot.",ephemeral=True); return
+    try:
+        data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
+        if not team:
+            msg="❌ Staff: assign yourself as HC first." if is_staff(interaction) else "❌ You're not HC or AHC of any team."
+            await interaction.followup.send(msg,ephemeral=True); return
+        if player.id==interaction.user.id:
+            await interaction.followup.send("❌ Can't offer yourself.",ephemeral=True); return
+        if player.bot:
+            await interaction.followup.send("❌ Can't offer a bot.",ephemeral=True); return
 
-    roster=team.setdefault("roster",[])
-    if len(roster)>=MAX_ROSTER:
-        await interaction.followup.send(f"❌ Roster cap ({MAX_ROSTER}) reached.",ephemeral=True); return
-    if str(player.id) in [r["id"] for r in roster]:
-        await interaction.followup.send(f"❌ {player.display_name} is already on the team.",ephemeral=True); return
+        roster=team.setdefault("roster",[])
+        if len(roster)>=MAX_ROSTER:
+            await interaction.followup.send(f"❌ Roster cap ({MAX_ROSTER}) reached.",ephemeral=True); return
+        if str(player.id) in [r["id"] for r in roster]:
+            await interaction.followup.send(f"❌ {player.display_name} is already on the team.",ephemeral=True); return
 
-    oid=f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
-    team_logo=team.get("logo_url",""); team_emoji=team.get("emoji","")
-    hc_id=team.get("head_coach_id")
-    data.setdefault("offers",{})[oid]={
-        "team_role_id":rid,"team_name":team["name"],"player_id":str(player.id),
-        "hc_id":hc_id,"timestamp":datetime.utcnow().isoformat(),"guild_id":str(interaction.guild.id),
-    }
-    await save_data(data)
+        oid=f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
+        team_logo=team.get("logo_url",""); team_emoji=team.get("emoji","")
+        hc_id=team.get("head_coach_id")
+        data.setdefault("offers",{})[oid]={
+            "team_role_id":rid,"team_name":team["name"],"player_id":str(player.id),
+            "hc_id":hc_id,"timestamp":datetime.utcnow().isoformat(),"guild_id":str(interaction.guild.id),
+        }
+        await save_data(data)
 
-    hc_rbx=team.get("head_coach_roblox","")
-    hc_line=f"<@{hc_id}> `{hc_rbx}`".strip() if hc_id else "*vacant*"
-    emoji=team_emoji+" " if team_emoji else ""
-    dm=discord.Embed(title=f"offer from the {team['name']}",
-        description=f"You've been offered a roster spot on {emoji}**{team['name']}**!",
-        color=team.get("color",UFF_COLOR))
-    dm.add_field(name="head coach:",value=hc_line,inline=False)
-    dm.add_field(name="\u200b",value="You have **12 hours** to accept or ignore.",inline=False)
-    thumb=team_logo or _league_thumb(interaction.guild)
-    if thumb: dm.set_thumbnail(url=thumb)
-    dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
+        hc_rbx=team.get("head_coach_roblox","")
+        hc_line=f"<@{hc_id}> `{hc_rbx}`".strip() if hc_id else "*vacant*"
+        emoji=team_emoji+" " if team_emoji else ""
+        dm=discord.Embed(title=f"offer from the {team['name']}",
+            description=f"You've been offered a roster spot on {emoji}**{team['name']}**!",
+            color=team.get("color",UFF_COLOR))
+        dm.add_field(name="head coach:",value=hc_line,inline=False)
+        dm.add_field(name="\u200b",value="You have **12 hours** to accept or ignore.",inline=False)
+        thumb=team_logo or _league_thumb(interaction.guild)
+        if thumb: dm.set_thumbnail(url=thumb)
+        dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
 
-    team_role=get_role(interaction.guild,rid)
-    view=OfferView(oid,int(rid),team["name"],team_logo,team_emoji,hc_id,player.id,interaction.guild.id)
-    try: await player.send(embed=dm,view=view)
-    except discord.Forbidden:
-        data.get("offers",{}).pop(oid,None); await save_data(data)
-        await interaction.followup.send(f"❌ Can't DM **{player.display_name}**.",ephemeral=True); return
+        team_role=get_role(interaction.guild,rid)
+        view=OfferView(oid,int(rid),team["name"],team_logo,team_emoji,hc_id,player.id,interaction.guild.id)
+        try: await player.send(embed=dm,view=view)
+        except discord.Forbidden:
+            data.get("offers",{}).pop(oid,None); await save_data(data)
+            await interaction.followup.send(f"❌ Can't DM **{player.display_name}**.",ephemeral=True); return
 
-    await interaction.followup.send(f"✅ Offer sent to **{player.display_name}** — 12 hours to accept.",ephemeral=True)
+        await interaction.followup.send(f"✅ Offer sent to **{player.display_name}** — 12 hours to accept.",ephemeral=True)
+    except Exception as e:
+        await _cmd_error(interaction, "/offer", e)
 
 
 @bot.tree.command(name="release",description="Release a player from your team")
 @app_commands.describe(player="The player to release")
 async def release(interaction:discord.Interaction,player:discord.Member):
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
-    if not team and not is_staff(interaction):
-        await interaction.followup.send("❌ You're not HC or AHC of any team.",ephemeral=True); return
-    if not team and is_staff(interaction):
-        for r,t in data["teams"].items():
-            if str(player.id) in [x["id"] for x in t.get("roster",[])]:
-                rid,team=r,t; break
-        if not team:
-            await interaction.followup.send(f"❌ {player.display_name} isn't on any registered team.",ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
+        if not team and not is_staff(interaction):
+            await interaction.followup.send("❌ You're not HC or AHC of any team.",ephemeral=True); return
+        if not team and is_staff(interaction):
+            for r,t in data["teams"].items():
+                if str(player.id) in [x["id"] for x in t.get("roster",[])]:
+                    rid,team=r,t; break
+            if not team:
+                await interaction.followup.send(f"❌ {player.display_name} isn't on any registered team.",ephemeral=True); return
 
-    roster=team.setdefault("roster",[])
-    before=len(roster)
-    team["roster"]=[r for r in roster if r["id"]!=str(player.id)]
-    if len(team["roster"])==before:
-        await interaction.followup.send(f"❌ {player.display_name} isn't on **{team['name']}**.",ephemeral=True); return
+        roster=team.setdefault("roster",[])
+        before=len(roster)
+        team["roster"]=[r for r in roster if r["id"]!=str(player.id)]
+        if len(team["roster"])==before:
+            await interaction.followup.send(f"❌ {player.display_name} isn't on **{team['name']}**.",ephemeral=True); return
 
-    await save_data(data)
+        await save_data(data)
 
-    team_role=get_role(interaction.guild,rid); rf=False
-    if team_role and team_role in player.roles:
-        try: await player.remove_roles(team_role,reason=f"Released from {team['name']}")
-        except discord.Forbidden: rf=True
+        team_role=get_role(interaction.guild,rid); rf=False
+        if team_role and team_role in player.roles:
+            try: await player.remove_roles(team_role,reason=f"Released from {team['name']}")
+            except discord.Forbidden: rf=True
 
-    embed=await build_tx_embed("released",player,team,team_role,interaction.guild,color=0xED4245)
-    msg=f"✅ Released **{player.display_name}** from **{team['name']}**."
-    if rf: msg+=_role_warn(team["name"])
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+        embed,file=await build_tx_embed("released",player,team,team_role,interaction.guild,color=0xED4245)
+        msg=f"✅ Released **{player.display_name}** from **{team['name']}**."
+        if rf: msg+=_role_warn(team["name"])
+        await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg,file=file)
+    except Exception as e:
+        await _cmd_error(interaction, "/release", e)
 
 
 @bot.tree.command(name="demand",description="Demand a release from your current team (1 per player lifetime)")
 async def demand(interaction:discord.Interaction):
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    data=await load_data(); uid=str(interaction.user.id)
-    found_rid,found_team=None,None
-    for r,t in data["teams"].items():
-        if uid in [x["id"] for x in t.get("roster",[])]:
-            found_rid,found_team=r,t; break
-    if not found_team:
-        await interaction.followup.send("❌ You aren't on any registered team.",ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data=await load_data(); uid=str(interaction.user.id)
+        found_rid,found_team=None,None
+        for r,t in data["teams"].items():
+            if uid in [x["id"] for x in t.get("roster",[])]:
+                found_rid,found_team=r,t; break
+        if not found_team:
+            await interaction.followup.send("❌ You aren't on any registered team.",ephemeral=True); return
 
-    extra=data.get("extra_demands",{}).get(uid,0)
-    if data.get("demand_used",{}).get(uid,False) and extra<=0:
-        await interaction.followup.send(
-            "❌ You've already used your demand. Players get **1 demand** lifetime.\nAsk an admin for `/grant_extra_demand`.",
-            ephemeral=True); return
+        extra=data.get("extra_demands",{}).get(uid,0)
+        if data.get("demand_used",{}).get(uid,False) and extra<=0:
+            await interaction.followup.send(
+                "❌ You've already used your demand. Players get **1 demand** lifetime.\nAsk an admin for `/grant_extra_demand`.",
+                ephemeral=True); return
 
-    if data.get("demand_used",{}).get(uid,False):
-        data["extra_demands"][uid]=extra-1
-    else:
-        data.setdefault("demand_used",{})[uid]=True
+        if data.get("demand_used",{}).get(uid,False):
+            data["extra_demands"][uid]=extra-1
+        else:
+            data.setdefault("demand_used",{})[uid]=True
 
-    found_team["roster"]=[r for r in found_team.get("roster",[]) if r["id"]!=uid]
-    await save_data(data)
+        found_team["roster"]=[r for r in found_team.get("roster",[]) if r["id"]!=uid]
+        await save_data(data)
 
-    blox=await bloxlink_lookup(interaction.user.id,interaction.guild.id)
-    rbx_name=blox.get("roblox_username","Unknown"); rbx_avatar=blox.get("avatar_url","")
-    team_role=get_role(interaction.guild,found_rid); rf=False
-    if team_role and team_role in interaction.user.roles:
-        try: await interaction.user.remove_roles(team_role,reason=f"Demand release from {found_team['name']}")
-        except discord.Forbidden: rf=True
+        blox=await bloxlink_lookup(interaction.user.id,interaction.guild.id)
+        team_role=get_role(interaction.guild,found_rid); rf=False
+        if team_role and team_role in interaction.user.roles:
+            try: await interaction.user.remove_roles(team_role,reason=f"Demand release from {found_team['name']}")
+            except discord.Forbidden: rf=True
 
-    emoji=found_team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
-    role_str=team_role.mention if team_role else f"**{found_team['name']}**"
-    embed=discord.Embed(
-        description=(
-            f"{interaction.user.mention} (@{interaction.user.name}) `{rbx_name}` "
-            f"has demanded a release from {prefix}{role_str}!\n\n"
-            f"{_info_block(found_team)}"
-        ),
-        color=0xED4245,
-    )
-    embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    if rbx_avatar: embed.set_thumbnail(url=rbx_avatar)
-    elif found_team.get("logo_url"): embed.set_thumbnail(url=found_team["logo_url"])
-    if found_team.get("logo_url"): embed.set_image(url=found_team["logo_url"])
+        emoji=found_team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
+        role_str=team_role.mention if team_role else f"**{found_team['name']}**"
+        embed=discord.Embed(
+            description=(
+                f"{_player_tx_line(interaction.user, blox)} has demanded a release "
+                f"from {prefix}{role_str}!\n\n"
+                f"{_info_block(found_team)}"
+            ),
+            color=0xED4245,
+        )
+        embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
+        file=await _apply_tx_images(embed, blox, found_team, interaction.guild)
 
-    msg=f"✅ Your demand from **{found_team['name']}** has been posted."
-    if rf: msg+=_role_warn(found_team["name"])
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+        msg=f"✅ Your demand from **{found_team['name']}** has been posted."
+        if rf: msg+=_role_warn(found_team["name"])
+        await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg,file=file)
+    except Exception as e:
+        await _cmd_error(interaction, "/demand", e)
 
 
 @bot.tree.command(name="grant_extra_demand",description="[Owner] Grant a player an extra demand token")
@@ -1110,65 +1258,78 @@ async def grant_extra_demand(interaction:discord.Interaction,player:discord.Memb
 @app_commands.describe(player="The player to promote")
 async def promote_coach(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
-    data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
-    if not team and is_staff(interaction):
-        for r,t in data["teams"].items():
-            if str(player.id) in [x["id"] for x in t.get("roster",[])]:
-                rid,team=r,t; break
-    if not team:
-        await interaction.followup.send("❌ You're not HC of any team. Only HCs and staff can promote.",ephemeral=True); return
-    roster=team.setdefault("roster",[])
-    if str(player.id) not in [r["id"] for r in roster]:
-        await interaction.followup.send(f"❌ {player.display_name} must be on the roster first.",ephemeral=True); return
-
-    blox=await bloxlink_lookup(player.id,interaction.guild.id); rbx=blox.get("roblox_username","")
-    team.update(ahc_id=str(player.id),ahc_name=player.name,ahc_roblox=rbx)
-    for r in roster:
-        if r["id"]==str(player.id): r["role"]="Assistant Head Coach"
-    await save_data(data)
-
-    ahc_role=interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
-    hc_role=interaction.guild.get_role(HEAD_COACH_ROLE_ID); rf=False
     try:
-        if ahc_role: await player.add_roles(ahc_role,reason="Promoted to AHC")
-        if hc_role and hc_role in player.roles: await player.remove_roles(hc_role,reason="Promoted to AHC")
-    except discord.Forbidden: rf=True
+        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
+        if not team and is_staff(interaction):
+            for r,t in data["teams"].items():
+                if str(player.id) in [x["id"] for x in t.get("roster",[])]:
+                    rid,team=r,t; break
+        if not team:
+            await interaction.followup.send("❌ You're not HC of any team. Only HCs and staff can promote.",ephemeral=True); return
+        roster=team.setdefault("roster",[])
+        if str(player.id) not in [r["id"] for r in roster]:
+            await interaction.followup.send(f"❌ {player.display_name} must be on the roster first.",ephemeral=True); return
 
-    team_role=get_role(interaction.guild,rid)
-    embed=await build_coach_embed("assistant coach promotion",player,team,team_role,interaction.guild,color=team.get("color",UFF_COLOR))
-    msg=f"✅ **{player.display_name}** promoted to AHC of **{team['name']}**."
-    if rf: msg+=_role_warn("Assistant Coach")
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+        blox=await bloxlink_lookup(player.id,interaction.guild.id)
+        team.update(ahc_id=str(player.id),ahc_name=player.name,ahc_roblox=blox.get("roblox_username",""))
+        for r in roster:
+            if r["id"]==str(player.id): r["role"]="Assistant Head Coach"
+        await save_data(data)
+
+        ahc_role=interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
+        hc_role=interaction.guild.get_role(HEAD_COACH_ROLE_ID); rf=False
+        try:
+            if ahc_role: await player.add_roles(ahc_role,reason="Promoted to AHC")
+            if hc_role and hc_role in player.roles: await player.remove_roles(hc_role,reason="Promoted to AHC")
+        except discord.Forbidden: rf=True
+
+        team_role=get_role(interaction.guild,rid)
+        embed,file=await build_coach_embed(
+            "assistant coach promotion",player,team,team_role,interaction.guild,
+            color=team.get("color",UFF_COLOR), blox=blox
+        )
+        msg=f"✅ **{player.display_name}** promoted to AHC of **{team['name']}**."
+        if rf: msg+=_role_warn("Assistant Coach")
+        await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg,file=file)
+    except Exception as e:
+        await _cmd_error(interaction, "/promote_coach", e)
 
 
 @bot.tree.command(name="demote_coach",description="Demote the Assistant Head Coach back to player")
 @app_commands.describe(player="The AHC to demote")
 async def demote_coach(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
-    data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
-    if not team and is_staff(interaction):
-        for r,t in data["teams"].items():
-            if t.get("ahc_id")==str(player.id): rid,team=r,t; break
-    if not team:
-        await interaction.followup.send("❌ You're not HC of any team.",ephemeral=True); return
-    if team.get("ahc_id")!=str(player.id):
-        await interaction.followup.send(f"❌ {player.display_name} is not the AHC of **{team['name']}**.",ephemeral=True); return
-
-    team.update(ahc_id=None,ahc_name=None,ahc_roblox="")
-    for r in team.get("roster",[]):
-        if r["id"]==str(player.id): r["role"]="Player"
-    await save_data(data)
-
-    ahc_role=interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID); rf=False
     try:
-        if ahc_role and ahc_role in player.roles: await player.remove_roles(ahc_role,reason="Demoted from AHC")
-    except discord.Forbidden: rf=True
+        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
+        if not team and is_staff(interaction):
+            for r,t in data["teams"].items():
+                if t.get("ahc_id")==str(player.id): rid,team=r,t; break
+        if not team:
+            await interaction.followup.send("❌ You're not HC of any team.",ephemeral=True); return
+        if team.get("ahc_id")!=str(player.id):
+            await interaction.followup.send(f"❌ {player.display_name} is not the AHC of **{team['name']}**.",ephemeral=True); return
 
-    team_role=get_role(interaction.guild,rid)
-    embed=await build_coach_embed("assistant coach demotion",player,team,team_role,interaction.guild,color=0xED4245)
-    msg=f"✅ **{player.display_name}** demoted from AHC of **{team['name']}**."
-    if rf: msg+=_role_warn("Assistant Coach")
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+        team.update(ahc_id=None,ahc_name=None,ahc_roblox="")
+        for r in team.get("roster",[]):
+            if r["id"]==str(player.id): r["role"]="Player"
+        await save_data(data)
+
+        ahc_role=interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID); rf=False
+        try:
+            if ahc_role and ahc_role in player.roles: await player.remove_roles(ahc_role,reason="Demoted from AHC")
+        except discord.Forbidden: rf=True
+
+        blox=await bloxlink_lookup(player.id,interaction.guild.id)
+        team_role=get_role(interaction.guild,rid)
+        embed,file=await build_coach_embed(
+            "assistant coach demotion",player,team,team_role,interaction.guild,
+            color=0xED4245, blox=blox
+        )
+        msg=f"✅ **{player.display_name}** demoted from AHC of **{team['name']}**."
+        if rf: msg+=_role_warn("Assistant Coach")
+        await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg,file=file)
+    except Exception as e:
+        await _cmd_error(interaction, "/demote_coach", e)
 
 
 @bot.tree.command(name="disband",description="Disband a team — removes all players and coaches")
@@ -1218,37 +1379,40 @@ async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.
 @app_commands.describe(team_role="The team's Discord role")
 async def roster_cmd(interaction:discord.Interaction,team_role:discord.Role):
     await interaction.response.defer(ephemeral=True)
-    data=await load_data(); team=get_team_by_role(data,team_role.id)
-    if not team:
-        await interaction.followup.send(f"❌ {team_role.mention} isn't registered.",ephemeral=True); return
+    try:
+        data=await load_data(); team=get_team_by_role(data,team_role.id)
+        if not team:
+            await interaction.followup.send(f"❌ {team_role.mention} isn't registered.",ephemeral=True); return
 
-    roster=team.get("roster",[]); color=team.get("color",UFF_COLOR)
-    emoji=team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
-    embed=discord.Embed(title=f"{prefix}{team['name'].lower()} roster",
-                        description=f"> roster: **{len(roster)}/{MAX_ROSTER}**",color=color)
+        roster=team.get("roster",[]); color=team.get("color",UFF_COLOR)
+        emoji=team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
+        embed=discord.Embed(title=f"{prefix}{team['name'].lower()} roster",
+                            description=f"> roster: **{len(roster)}/{MAX_ROSTER}**",color=color)
 
-    hc_id=team.get("head_coach_id")
-    if hc_id:
-        rbx=f" `{team.get('head_coach_roblox','')}`" if team.get("head_coach_roblox") else ""
-        embed.add_field(name="head coach:",
-            value=f"> <@{hc_id}> (@{team.get('head_coach_name','')}) ✓{rbx}",inline=False)
+        hc_id=team.get("head_coach_id")
+        if hc_id:
+            rbx=f" `{team.get('head_coach_roblox','')}`" if team.get("head_coach_roblox") else ""
+            embed.add_field(name="head coach:",
+                value=f"> <@{hc_id}> (@{team.get('head_coach_name','')}) ✓{rbx}",inline=False)
 
-    ahc_lines=[]; pl_lines=[]
-    for r in roster:
-        rbx=f" `{r['roblox']}`" if r.get("roblox") else ""
-        line=f"> <@{r['id']}> (@{r['name']}) ✓{rbx}"
-        role=r.get("role","Player")
-        if role=="Assistant Head Coach": ahc_lines.append(line)
-        elif role!="Head Coach": pl_lines.append(line)
+        ahc_lines=[]; pl_lines=[]
+        for r in roster:
+            rbx=f" `{r['roblox']}`" if r.get("roblox") else ""
+            line=f"> <@{r['id']}> (@{r['name']}) ✓{rbx}"
+            role=r.get("role","Player")
+            if role=="Assistant Head Coach": ahc_lines.append(line)
+            elif role!="Head Coach": pl_lines.append(line)
 
-    if ahc_lines: embed.add_field(name="assistant head coach:",value="\n".join(ahc_lines),inline=False)
-    if pl_lines:  embed.add_field(name="players:",value="\n".join(pl_lines),inline=False)
-    elif not roster: embed.add_field(name="players:",value="> *No players yet.*",inline=False)
+        if ahc_lines: embed.add_field(name="assistant head coach:",value="\n".join(ahc_lines),inline=False)
+        if pl_lines:  embed.add_field(name="players:",value="\n".join(pl_lines),inline=False)
+        elif not roster: embed.add_field(name="players:",value="> *No players yet.*",inline=False)
 
-    logo=team.get("logo_url","") or _league_thumb(interaction.guild)
-    if logo: embed.set_thumbnail(url=logo)
-    embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    await interaction.followup.send(embed=embed,ephemeral=True)
+        logo=team.get("logo_url","") or _league_thumb(interaction.guild)
+        if logo: embed.set_thumbnail(url=logo)
+        embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
+        await interaction.followup.send(embed=embed,ephemeral=True)
+    except Exception as e:
+        await _cmd_error(interaction, "/roster", e)
 
 
 @bot.tree.command(name="coaches",description="View all head coaches across the league")
