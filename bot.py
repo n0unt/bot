@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 import asyncpg
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image
     _PIL_OK = True
 except ImportError:
     _PIL_OK = False
@@ -297,12 +297,22 @@ def _parse_bloxlink_body(body):
     rid = roblox.get("id") or roblox.get("Id")
     return str(rid) if rid is not None else None
 
-def _roblox_headshot_url(roblox_id):
-    """Direct Roblox headshot URL — works reliably in Discord embeds."""
-    return (
-        f"https://www.roblox.com/headshot-thumbnail/image"
-        f"?userId={roblox_id}&width=150&height=150&format=png"
+async def _resolve_roblox_headshot(session, roblox_id):
+    """Fetch the CDN headshot URL from Roblox's thumbnails API."""
+    if not roblox_id:
+        return None
+    api_url = (
+        f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={roblox_id}&size=420x420&format=Png&isCircular=false"
     )
+    body, err = await _fetch_json(session, api_url, {})
+    if not body or err:
+        return None
+    for item in body.get("data", []):
+        image_url = _valid_embed_url(item.get("imageUrl", ""))
+        if image_url and item.get("state") in ("Completed", "Pending"):
+            return image_url
+    return None
 
 async def _fetch_json(session, url, headers):
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
@@ -376,10 +386,11 @@ async def bloxlink_lookup(discord_id, guild_id, team=None):
                 if rid:
                     body, err = await _fetch_json(session, f"https://users.roblox.com/v1/users/{rid}", {})
                     username = body.get("name", str(rid)) if body and not err else str(rid)
+                    avatar_url = await _resolve_roblox_headshot(session, rid) or ""
                     return {
                         "roblox_username": username,
                         "roblox_id": int(rid),
-                        "avatar_url": _roblox_headshot_url(rid),
+                        "avatar_url": avatar_url,
                     }
                 result = {"error": last_err}
         except Exception as e:
@@ -390,20 +401,26 @@ async def bloxlink_lookup(discord_id, guild_id, team=None):
     rbx_name, rbx_id = _roster_roblox_hint(team, discord_id)
     if rbx_id:
         rid = str(rbx_id)
+        try:
+            async with aiohttp.ClientSession() as session:
+                avatar_url = await _resolve_roblox_headshot(session, rid) or ""
+        except Exception:
+            avatar_url = ""
         return {
             "roblox_username": rbx_name or rid,
             "roblox_id": int(rid),
-            "avatar_url": _roblox_headshot_url(rid),
+            "avatar_url": avatar_url,
         }
     if rbx_name:
         try:
             async with aiohttp.ClientSession() as session:
                 rid = await _roblox_id_from_username(session, rbx_name)
                 if rid:
+                    avatar_url = await _resolve_roblox_headshot(session, rid) or ""
                     return {
                         "roblox_username": rbx_name,
                         "roblox_id": int(rid),
-                        "avatar_url": _roblox_headshot_url(rid),
+                        "avatar_url": avatar_url,
                     }
         except Exception:
             pass
@@ -413,44 +430,65 @@ async def _download_image(session, url):
     if not url:
         return None
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        headers = {"User-Agent": "UFF-Discord-Bot/1.0"}
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
             if r.status == 200:
-                return await r.read()
+                data = await r.read()
+                if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8":
+                    return data
     except Exception:
         pass
     return None
 
+async def _fetch_avatar_bytes(session, avatar_url, roblox_id=None):
+    """Download avatar PNG bytes from a CDN URL or resolve via Roblox ID."""
+    avatar_url = _valid_embed_url(avatar_url)
+    avatar_bytes = await _download_image(session, avatar_url) if avatar_url else None
+    if avatar_bytes:
+        return avatar_bytes, avatar_url
+    if not roblox_id:
+        return None, avatar_url
+    headshot_url = await _resolve_roblox_headshot(session, roblox_id)
+    if not headshot_url:
+        return None, avatar_url
+    avatar_bytes = await _download_image(session, headshot_url)
+    return avatar_bytes, headshot_url
+
 def _make_composite_png(avatar_bytes, logo_bytes, size=256):
-    """Half-circle avatar (left) + half-circle team logo (right), like astara."""
+    """Roblox headshot in front with team logo peeking out behind on the right."""
     if not _PIL_OK:
         return None
     avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
     logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-    avatar = avatar.resize((size, size), Image.Resampling.LANCZOS)
-    logo = logo.resize((size, size), Image.Resampling.LANCZOS)
 
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    half = size // 2
-    canvas.paste(avatar.crop((0, 0, half, size)), (0, 0))
-    canvas.paste(logo.crop((half, 0, size, size)), (half, 0))
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 255))
 
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-    canvas.putalpha(mask)
+    logo_dim = int(size * 0.72)
+    logo = logo.resize((logo_dim, logo_dim), Image.Resampling.LANCZOS)
+    logo_x = int(size * 0.38)
+    logo_y = (size - logo_dim) // 2
+    canvas.paste(logo, (logo_x, logo_y), logo)
+
+    av_dim = int(size * 0.92)
+    avatar = avatar.resize((av_dim, av_dim), Image.Resampling.LANCZOS)
+    av_x = int(size * 0.02)
+    av_y = (size - av_dim) // 2
+    canvas.paste(avatar, (av_x, av_y), avatar)
 
     out = io.BytesIO()
     canvas.save(out, format="PNG")
     out.seek(0)
     return out
 
-async def make_composite_file(avatar_url, logo_url):
-    avatar_url = _valid_embed_url(avatar_url)
+async def make_composite_file(avatar_url, logo_url, roblox_id=None):
     logo_url = _valid_embed_url(logo_url)
-    if not avatar_url or not logo_url or not _PIL_OK:
+    if not logo_url or not _PIL_OK:
         return None
     try:
         async with aiohttp.ClientSession() as session:
-            avatar_bytes = await _download_image(session, avatar_url)
+            avatar_bytes, _ = await _fetch_avatar_bytes(session, avatar_url, roblox_id)
             logo_bytes = await _download_image(session, logo_url)
         if not avatar_bytes or not logo_bytes:
             return None
@@ -474,14 +512,22 @@ def _player_tx_line(player, blox):
 async def _apply_tx_images(embed, blox, team, guild):
     """
     Transaction thumbnail only (top-right):
-      1. Composite: Roblox headshot (left) + team logo (right)
+      1. Composite: Roblox headshot over team logo
       2. Roblox headshot alone
       3. Team logo
-    No bottom embed image — that was duplicating the logo.
     """
-    avatar_url = _valid_embed_url(blox.get("avatar_url", ""))
     logo_url = _team_logo_url(team, guild)
-    composite = await make_composite_file(avatar_url, logo_url)
+    avatar_url = _valid_embed_url(blox.get("avatar_url", ""))
+    roblox_id = blox.get("roblox_id")
+
+    if not avatar_url and roblox_id:
+        try:
+            async with aiohttp.ClientSession() as session:
+                avatar_url = await _resolve_roblox_headshot(session, roblox_id)
+        except Exception:
+            log.exception("Headshot lookup failed for Roblox ID %s", roblox_id)
+
+    composite = await make_composite_file(avatar_url, logo_url, roblox_id=roblox_id)
     if composite:
         _safe_set_thumbnail(embed, "attachment://composite.png", allow_attachment=True)
         return composite
