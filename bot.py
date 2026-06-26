@@ -9,7 +9,7 @@ CHANGES THIS VERSION:
     * Info block with "> " prefix lines
     * Team logo as thumbnail (top-right corner)
     * Roblox headshot as main image (bottom)
-  - /set_team_emoji command added (works!)
+  - /team_emoji command added (works!)
   - /coaches shows: team_emoji role_mention — hc_info (single vertical list)
   - Bloxlink avatar fetch fixed
   - All non-public commands ephemeral
@@ -866,10 +866,10 @@ async def set_team_image(interaction:discord.Interaction,team_role:discord.Role,
     await interaction.response.send_message(embed=embed,ephemeral=True)
 
 
-@bot.tree.command(name="set_team_emoji",description="[Staff] Set the emoji shown before a team's name in transactions and /coaches")
+@bot.tree.command(name="team_emoji",description="[Staff] Set the emoji shown before a team's name in transactions and /coaches")
 @app_commands.describe(team_role="The team's Discord role",emoji="The emoji to use (e.g. 🏈 or a custom server emoji)")
 @app_commands.default_permissions(administrator=True)
-async def set_team_emoji(interaction:discord.Interaction,team_role:discord.Role,emoji:str):
+async def team_emoji(interaction:discord.Interaction,team_role:discord.Role,emoji:str):
     if not is_staff(interaction):
         await interaction.response.send_message("❌ Staff only.",ephemeral=True); return
     data=await load_data(); rid=str(team_role.id)
@@ -1400,10 +1400,10 @@ async def set_team_image(interaction:discord.Interaction,team_role:discord.Role,
     await interaction.response.send_message(embed=embed,ephemeral=True)
 
 
-@bot.tree.command(name="set_team_emoji",description="[Staff] Set the emoji shown before a team's name in transactions and /coaches")
+@bot.tree.command(name="team_emoji",description="[Staff] Set the emoji shown before a team's name in transactions and /coaches")
 @app_commands.describe(team_role="The team's Discord role",emoji="The emoji to use (e.g. 🏈 or a custom server emoji)")
 @app_commands.default_permissions(administrator=True)
-async def set_team_emoji(interaction:discord.Interaction,team_role:discord.Role,emoji:str):
+async def team_emoji(interaction:discord.Interaction,team_role:discord.Role,emoji:str):
     if not is_staff(interaction):
         await interaction.response.send_message("❌ Staff only.",ephemeral=True); return
     data=await load_data(); rid=str(team_role.id)
@@ -2048,7 +2048,7 @@ async def help_uff(interaction:discord.Interaction):
     embed.add_field(name="📋 Transactions",value=(
         "`/set_team` — [Staff] Register a team role\n"
         "`/set_team_image` — [Staff] Set team logo URL\n"
-        "`/set_team_emoji` — [Staff] Set team emoji for transactions/coaches\n"
+        "`/team_emoji` — [Staff] Set team emoji for transactions/coaches\n"
         "`/assign_hc` — [Staff] Assign a head coach\n"
         "`/offer` — [HC/AHC] Send a DM roster offer (12h)\n"
         "`/release` — [HC/AHC/Staff] Release a player\n"
