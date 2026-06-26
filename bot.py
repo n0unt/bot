@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 import asyncpg
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     _PIL_OK = True
 except ImportError:
     _PIL_OK = False
@@ -456,14 +456,24 @@ async def _fetch_avatar_bytes(session, avatar_url, roblox_id=None):
     avatar_bytes = await _download_image(session, headshot_url)
     return avatar_bytes, headshot_url
 
+def _remove_roblox_backdrop(img, tolerance=28):
+    """Remove Roblox's solid black headshot backdrop without eating dark clothing."""
+    img = img.convert("RGBA")
+    w, h = img.size
+    for x, y in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+        r, g, b, _ = img.getpixel((x, y))
+        if max(r, g, b) <= tolerance:
+            ImageDraw.floodfill(img, (x, y), (0, 0, 0, 0), thresh=tolerance)
+    return img
+
 def _make_composite_png(avatar_bytes, logo_bytes, size=256):
     """Roblox headshot in front with team logo peeking out behind on the right."""
     if not _PIL_OK:
         return None
-    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+    avatar = _remove_roblox_backdrop(Image.open(io.BytesIO(avatar_bytes)))
     logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
 
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
     logo_dim = int(size * 0.72)
     logo = logo.resize((logo_dim, logo_dim), Image.Resampling.LANCZOS)
