@@ -224,8 +224,49 @@ def can_issue_suspension(i):
     if i.user.id in SUSPENSION_ALLOWED_USER_IDS: return True
     return bool({r.id for r in i.user.roles} & SUSPENSION_ALLOWED_ROLE_IDS) or is_admin(i)
 
+def _valid_embed_url(url, *, allow_attachment=False):
+    """Discord only accepts http(s) URLs, or attachment:// when a file is attached."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    if allow_attachment and url.startswith("attachment://"):
+        name = url[len("attachment://"):]
+        return url if name else None
+    if url.startswith(("http://", "https://")) and " " not in url:
+        return url
+    return None
+
+def _safe_set_thumbnail(embed, url, *, allow_attachment=False):
+    valid = _valid_embed_url(url, allow_attachment=allow_attachment)
+    if valid:
+        embed.set_thumbnail(url=valid)
+
+def _safe_set_image(embed, url):
+    valid = _valid_embed_url(url)
+    if valid:
+        embed.set_image(url=valid)
+
 def _league_thumb(guild):
-    return ZEVORA_LOGO_URL or UFF_THUMBNAIL or (str(guild.icon.url) if guild and guild.icon else "")
+    for candidate in (ZEVORA_LOGO_URL, UFF_THUMBNAIL):
+        valid = _valid_embed_url(candidate)
+        if valid:
+            return valid
+    if guild and guild.icon:
+        return _valid_embed_url(str(guild.icon.url))
+    return None
+
+def _team_logo_url(team, guild=None):
+    logo = _valid_embed_url(team.get("logo_url", ""))
+    if logo:
+        return logo
+    rid = team.get("role_id")
+    if guild and rid:
+        role = guild.get_role(int(rid))
+        if role and role.display_icon:
+            return _valid_embed_url(str(role.display_icon.url))
+    return None
 
 def _role_warn(label):
     return f"\n⚠️ Could not update **{label}** role — check bot role position and Manage Roles permission."
@@ -344,6 +385,8 @@ def _make_composite_png(avatar_bytes, logo_bytes, size=256):
     return out
 
 async def make_composite_file(avatar_url, logo_url):
+    avatar_url = _valid_embed_url(avatar_url)
+    logo_url = _valid_embed_url(logo_url)
     if not avatar_url or not logo_url or not _PIL_OK:
         return None
     try:
@@ -371,24 +414,20 @@ def _player_tx_line(player, blox):
 
 async def _apply_tx_images(embed, blox, team, guild):
     """Set thumbnail (composite or fallback) and bottom team logo image."""
-    avatar_url = blox.get("avatar_url", "")
-    logo_url = team.get("logo_url", "")
+    avatar_url = _valid_embed_url(blox.get("avatar_url", ""))
+    logo_url = _team_logo_url(team, guild)
     composite = await make_composite_file(avatar_url, logo_url)
     if composite:
-        embed.set_thumbnail(url="attachment://composite.png")
-        if logo_url:
-            embed.set_image(url=logo_url)
+        _safe_set_thumbnail(embed, "attachment://composite.png", allow_attachment=True)
+        _safe_set_image(embed, logo_url)
         return composite
     if avatar_url:
-        embed.set_thumbnail(url=avatar_url)
+        _safe_set_thumbnail(embed, avatar_url)
     elif logo_url:
-        embed.set_thumbnail(url=logo_url)
+        _safe_set_thumbnail(embed, logo_url)
     else:
-        lt = _league_thumb(guild)
-        if lt:
-            embed.set_thumbnail(url=lt)
-    if logo_url:
-        embed.set_image(url=logo_url)
+        _safe_set_thumbnail(embed, _league_thumb(guild))
+    _safe_set_image(embed, logo_url)
     return None
 
 # ── TEAM HELPERS ──────────────────────────────────────────────────────
@@ -507,6 +546,15 @@ async def build_coach_embed(action, player, team, team_role, guild, color=UFF_CO
     return embed, file
 
 async def post_tx(guild, embed, followup=None, interaction=None, msg="", ephemeral=True, file=None):
+    # Never send attachment:// refs without the matching file attached.
+    if embed.thumbnail and embed.thumbnail.url:
+        if embed.thumbnail.url.startswith("attachment://") and not file:
+            embed.set_thumbnail(url=None)
+        elif not _valid_embed_url(embed.thumbnail.url, allow_attachment=bool(file)):
+            embed.set_thumbnail(url=None)
+    if embed.image and embed.image.url and not _valid_embed_url(embed.image.url):
+        embed.set_image(url=None)
+
     ch = await get_tx_ch(guild)
     send_kwargs = {"embed": embed}
     if file:
@@ -604,17 +652,18 @@ class OfferView(discord.ui.View):
             color=team.get("color",UFF_COLOR),
         )
         embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-        composite = await make_composite_file(blox.get("avatar_url",""), team.get("logo_url",""))
+        avatar_url = _valid_embed_url(blox.get("avatar_url", ""))
+        logo_url = _team_logo_url(team, guild)
+        composite = await make_composite_file(avatar_url, logo_url)
         if composite:
-            embed.set_thumbnail(url="attachment://composite.png")
-            if team.get("logo_url"):
-                embed.set_image(url=team["logo_url"])
-        elif blox.get("avatar_url"):
-            embed.set_thumbnail(url=blox["avatar_url"])
-        elif team.get("logo_url"):
-            embed.set_thumbnail(url=team["logo_url"])
-        if team.get("logo_url") and not embed.image:
-            embed.set_image(url=team["logo_url"])
+            _safe_set_thumbnail(embed, "attachment://composite.png", allow_attachment=True)
+            _safe_set_image(embed, logo_url)
+        elif avatar_url:
+            _safe_set_thumbnail(embed, avatar_url)
+            _safe_set_image(embed, logo_url)
+        elif logo_url:
+            _safe_set_thumbnail(embed, logo_url)
+            _safe_set_image(embed, logo_url)
 
         ch=await get_tx_ch(guild)
         if ch:
@@ -626,7 +675,7 @@ class OfferView(discord.ui.View):
         desc=f"You accepted the offer from **{self.team_name}**!\n\nWelcome to the team."
         if role_failed: desc+="\n\n⚠️ Team role couldn't be added automatically."
         ae=discord.Embed(title="✅ Offer Accepted!",description=desc,color=0x57F287)
-        if self.team_logo: ae.set_thumbnail(url=self.team_logo)
+        _safe_set_thumbnail(ae, _valid_embed_url(self.team_logo))
         ae.set_footer(text=UFF_FOOTER)
         await interaction.edit_original_response(content=None,embed=ae,view=self)
 
@@ -651,7 +700,7 @@ class OfferView(discord.ui.View):
         data=await load_data(); data.get("offers",{}).pop(self.offer_id,None); await save_data(data)
         e=discord.Embed(title="❌ Offer Declined",
             description=f"You declined the offer from **{self.team_name}**.",color=0xED4245)
-        if self.team_logo: e.set_thumbnail(url=self.team_logo)
+        _safe_set_thumbnail(e, _valid_embed_url(self.team_logo))
         e.set_footer(text=UFF_FOOTER)
         await interaction.edit_original_response(embed=e,view=self)
         guild=bot.get_guild(self.guild_id)
@@ -1011,15 +1060,16 @@ async def set_team(interaction:discord.Interaction,team_role:discord.Role):
     icon=team_role.display_icon
     logo_url=""
     if icon is not None:
-        logo_url=str(icon.url) if hasattr(icon,"url") else ""
+        logo_url=_valid_embed_url(str(icon.url) if hasattr(icon,"url") else "") or ""
 
     data=await load_data(); rid=str(team_role.id); ex=data["teams"].get(rid,{})
+    saved_logo=logo_url or _valid_embed_url(ex.get("logo_url","")) or ""
     data["teams"][rid]={
         "name":team_name,"role_id":rid,
         "head_coach_id":ex.get("head_coach_id"),"head_coach_name":ex.get("head_coach_name"),
         "head_coach_roblox":ex.get("head_coach_roblox",""),
         "ahc_id":ex.get("ahc_id"),"ahc_name":ex.get("ahc_name"),"ahc_roblox":ex.get("ahc_roblox",""),
-        "logo_url":logo_url or ex.get("logo_url",""),
+        "logo_url":saved_logo,
         "emoji":ex.get("emoji",""),
         "roster":ex.get("roster",[]),
         "color":team_role.color.value or UFF_COLOR,
@@ -1027,8 +1077,10 @@ async def set_team(interaction:discord.Interaction,team_role:discord.Role):
     await save_data(data)
     embed=discord.Embed(title="team registered",color=UFF_COLOR,
         description=f"**{team_name}** registered!\nRole: {team_role.mention} | Transactions → <#{TRANSACTIONS_CHANNEL_ID}>")
-    if logo_url: embed.set_thumbnail(url=logo_url)
-    else: embed.description+="\n\n⚠️ No role icon found. Use `/set_team_image` to set a logo."
+    if saved_logo:
+        _safe_set_thumbnail(embed, saved_logo)
+    else:
+        embed.description+="\n\n⚠️ No role icon found. Use `/set_team_image` to set a logo."
     embed.set_footer(text=UFF_FOOTER)
     await interaction.followup.send(embed=embed,ephemeral=True)
 
@@ -1043,10 +1095,16 @@ async def set_team_image(interaction:discord.Interaction,team_role:discord.Role,
     data=await load_data(); rid=str(team_role.id)
     if rid not in data["teams"]:
         await interaction.followup.send(f"❌ {team_role.mention} not registered.",ephemeral=True); return
-    data["teams"][rid]["logo_url"]=logo_url
+    clean_url = _valid_embed_url(logo_url)
+    if not clean_url:
+        await interaction.followup.send(
+            "❌ That doesn't look like a valid image URL. Use a direct `https://` link ending in .png, .jpg, or .webp.",
+            ephemeral=True,
+        ); return
+    data["teams"][rid]["logo_url"]=clean_url
     await save_data(data)
     embed=discord.Embed(title="logo updated",color=UFF_COLOR,description=f"Logo for **{data['teams'][rid]['name']}** updated.")
-    embed.set_thumbnail(url=logo_url)
+    _safe_set_thumbnail(embed, data["teams"][rid]["logo_url"])
     await interaction.followup.send(embed=embed,ephemeral=True)
 
 
@@ -1121,7 +1179,8 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
             await interaction.followup.send(f"❌ {player.display_name} is already on the team.",ephemeral=True); return
 
         oid=f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
-        team_logo=team.get("logo_url",""); team_emoji=team.get("emoji","")
+        team_logo=_team_logo_url(team, interaction.guild) or ""
+        team_emoji=team.get("emoji","")
         hc_id=team.get("head_coach_id")
         data.setdefault("offers",{})[oid]={
             "team_role_id":rid,"team_name":team["name"],"player_id":str(player.id),
@@ -1138,7 +1197,7 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
         dm.add_field(name="head coach:",value=hc_line,inline=False)
         dm.add_field(name="\u200b",value="You have **12 hours** to accept or ignore.",inline=False)
         thumb=team_logo or _league_thumb(interaction.guild)
-        if thumb: dm.set_thumbnail(url=thumb)
+        _safe_set_thumbnail(dm, thumb)
         dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
 
         team_role=get_role(interaction.guild,rid)
@@ -1407,8 +1466,8 @@ async def roster_cmd(interaction:discord.Interaction,team_role:discord.Role):
         if pl_lines:  embed.add_field(name="players:",value="\n".join(pl_lines),inline=False)
         elif not roster: embed.add_field(name="players:",value="> *No players yet.*",inline=False)
 
-        logo=team.get("logo_url","") or _league_thumb(interaction.guild)
-        if logo: embed.set_thumbnail(url=logo)
+        logo=_team_logo_url(team, interaction.guild) or _league_thumb(interaction.guild)
+        _safe_set_thumbnail(embed, logo)
         embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
         await interaction.followup.send(embed=embed,ephemeral=True)
     except Exception as e:
@@ -1453,8 +1512,8 @@ async def coaches_cmd(interaction:discord.Interaction):
         for chunk in (chunks or ["*None*"]):
             embed.add_field(name="\u200b",value=chunk,inline=False)
 
-    thumb=ZEVORA_LOGO_URL or UFF_THUMBNAIL or _league_thumb(interaction.guild)
-    if thumb: embed.set_thumbnail(url=thumb)
+    thumb=_league_thumb(interaction.guild)
+    _safe_set_thumbnail(embed, thumb)
     embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
     await interaction.followup.send(embed=embed,ephemeral=True)
 
