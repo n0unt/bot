@@ -55,6 +55,10 @@ UFF_THUMBNAIL       = os.getenv("UFF_THUMBNAIL_URL", "")
 UFF_BANNER          = os.getenv("UFF_BANNER_URL", "")
 ZEVORA_LOGO_URL     = os.getenv("ZEVORA_LOGO_URL", "")
 
+# Off-season: set DEMAND_LIMIT_ENABLED=false (or leave unset) for unlimited demands.
+# In-season: set DEMAND_LIMIT_ENABLED=true on Railway to restore the 1-lifetime limit.
+DEMAND_LIMIT_ENABLED = os.getenv("DEMAND_LIMIT_ENABLED", "false").lower() in ("1", "true", "yes")
+
 TRANSACTIONS_CHANNEL_ID = 1262200420151984152
 UFF_FOOTER   = "United Flag Football League"
 UFF_COLOR    = 0xF0C040
@@ -1135,6 +1139,7 @@ async def on_ready():
     print(f"   Zevora Logo  : {'SET' if ZEVORA_LOGO_URL else 'NOT SET'}")
     print(f"   Database     : {'SET' if DATABASE_URL else 'NOT SET'}")
     print(f"   Pillow       : {'OK' if _PIL_OK else 'MISSING — pip install Pillow for avatar+logo thumbnails'}")
+    print(f"   Demand limit : {'ON (1 lifetime)' if DEMAND_LIMIT_ENABLED else 'OFF (off-season — unlimited)'}")
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1358,7 +1363,7 @@ async def release(interaction:discord.Interaction,player:discord.Member):
         await _cmd_error(interaction, "/release", e)
 
 
-@bot.tree.command(name="demand",description="Demand a release from your current team (1 per player lifetime)")
+@bot.tree.command(name="demand",description="Demand a release from your current team")
 async def demand(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1370,16 +1375,17 @@ async def demand(interaction:discord.Interaction):
         if not found_team:
             await interaction.followup.send("❌ You aren't on any registered team.",ephemeral=True); return
 
-        extra=data.get("extra_demands",{}).get(uid,0)
-        if data.get("demand_used",{}).get(uid,False) and extra<=0:
-            await interaction.followup.send(
-                "❌ You've already used your demand. Players get **1 demand** lifetime.\nAsk an admin for `/grant_extra_demand`.",
-                ephemeral=True); return
+        if DEMAND_LIMIT_ENABLED:
+            extra=data.get("extra_demands",{}).get(uid,0)
+            if data.get("demand_used",{}).get(uid,False) and extra<=0:
+                await interaction.followup.send(
+                    "❌ You've already used your demand. Players get **1 demand** lifetime.\nAsk an admin for `/grant_extra_demand`.",
+                    ephemeral=True); return
 
-        if data.get("demand_used",{}).get(uid,False):
-            data["extra_demands"][uid]=extra-1
-        else:
-            data.setdefault("demand_used",{})[uid]=True
+            if data.get("demand_used",{}).get(uid,False):
+                data["extra_demands"][uid]=extra-1
+            else:
+                data.setdefault("demand_used",{})[uid]=True
 
         found_team["roster"]=[r for r in found_team.get("roster",[]) if r["id"]!=uid]
         await save_data(data)
@@ -1908,7 +1914,9 @@ async def help_uff(interaction:discord.Interaction):
         "`/assign_hc` — [Staff] Assign a head coach\n"
         "`/offer` — [HC/AHC] Send a DM roster offer (12h)\n"
         "`/release` — [HC/AHC/Staff] Release a player\n"
-        "`/demand` — Demand your own release (1 lifetime)\n"
+        "`/demand` — Demand your own release"
+        + (" (1 lifetime)" if DEMAND_LIMIT_ENABLED else " (unlimited — off-season)")
+        + "\n"
         "`/grant_extra_demand` — [Owner] Grant extra demand token\n"
         "`/promote_coach` — [HC/Staff] Promote to AHC\n"
         "`/demote_coach` — [HC/Staff] Demote AHC\n"
