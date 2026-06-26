@@ -60,6 +60,7 @@ ZEVORA_LOGO_URL     = os.getenv("ZEVORA_LOGO_URL", "")
 DEMAND_LIMIT_ENABLED = os.getenv("DEMAND_LIMIT_ENABLED", "false").lower() in ("1", "true", "yes")
 
 TRANSACTIONS_CHANNEL_ID = 1262200420151984152
+COACHES_CHANNEL_ID      = int(os.getenv("COACHES_CHANNEL_ID", "1274811643338948618"))
 UFF_FOOTER   = "United Flag Football League"
 UFF_COLOR    = 0xF0C040
 CASUAL_COLOR = 0x5865F2
@@ -1595,7 +1596,8 @@ async def roster_cmd(interaction:discord.Interaction,team_role:discord.Role):
 
 @bot.tree.command(name="coaches",description="View all head coaches across the league")
 async def coaches_cmd(interaction:discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    public = interaction.channel_id == COACHES_CHANNEL_ID
+    await interaction.response.defer(ephemeral=not public)
     data=await load_data(); teams=data.get("teams",{})
     embed=discord.Embed(title="head coaches",color=UFF_COLOR)
 
@@ -1634,7 +1636,7 @@ async def coaches_cmd(interaction:discord.Interaction):
     thumb=_league_thumb(interaction.guild)
     _safe_set_thumbnail(embed, thumb)
     embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    await interaction.followup.send(embed=embed,ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=not public)
 
 # ══════════════════════════════════════════════════════════════════════
 # PICKUP COMMANDS
