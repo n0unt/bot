@@ -2,29 +2,31 @@
 UFF Discord Bot
 United Flag Football League
 
-CHANGES THIS VERSION (bugfix pass):
-  - FIX: load_data()/save_data() were doing up to 9 sequential DB round-trips
-    (one per key). Any latency there could blow past Discord's 3-second
-    interaction-ack window and show "interaction failed" even though the
-    bot was still working. Now batched into a single round-trip each.
-  - FIX: most slash commands called load_data()/save_data() BEFORE
-    acknowledging the interaction. Every command now defers immediately
-    and replies via followup, so the ack happens instantly regardless of
-    DB speed.
-  - FIX: button views (offer accept/decline, pickup accept/decline,
-    suspension confirm) now defer immediately and edit the original
-    response instead of doing all their work before acking.
-  - FIX: removed an accidental full duplicate of the suspension UI / bot
-    setup / transaction-command block that had been pasted into the file
-    twice.
+CHANGES THIS VERSION:
+  - FIX: /disband now fully DELETES the team entry from storage (not just
+    clears its roster/coach fields). It no longer shows up in /coaches at
+    all afterward — no more "vacant" placeholder. The Discord role itself
+    is untouched (staff can still re-register it later with /set_team),
+    but every player and the HC/AHC have the team role stripped and the
+    team record is gone.
+  - FIX: Offer spam prevention.
+      * You can no longer send a second offer to a player who already has
+        a PENDING offer from your team — the previous offer must be
+        accepted, declined, or expire first.
+      * After a decline (or a 12h expiry with no response), that same
+        team cannot re-offer that same player for 24 hours.
+      * This is enforced per (team, player) pair, not globally, so other
+        teams can still offer that player immediately.
+  - FIX: Assistant Head Coaches can now /offer and /release players for
+    their team — get_team_for_user() already covered this, but /release's
+    staff-fallback path was overriding it in some cases; logic re-verified
+    and tightened so AHCs always resolve to their team first.
 
   Previous version notes:
-  - Transaction embeds: compact, no title, description-only layout matching screenshots
-  - /set_team_emoji command added
-  - /coaches shows: team_emoji role_mention — hc_info (single vertical list)
-  - Bloxlink avatar fetch fixed
-  - All non-public commands ephemeral
-  - Staff roles updated
+  - Batched DB reads/writes (single round-trip)
+  - All commands defer immediately to avoid interaction timeouts
+  - Composite thumbnail (Roblox headshot + team logo)
+  - /set_team_emoji, ephemeral commands, updated staff roles
 """
 
 import discord
@@ -58,6 +60,9 @@ ZEVORA_LOGO_URL     = os.getenv("ZEVORA_LOGO_URL", "")
 # Off-season: set DEMAND_LIMIT_ENABLED=false (or leave unset) for unlimited demands.
 # In-season: set DEMAND_LIMIT_ENABLED=true on Railway to restore the 1-lifetime limit.
 DEMAND_LIMIT_ENABLED = os.getenv("DEMAND_LIMIT_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# How long after a decline/expiry before the SAME team can re-offer the SAME player.
+OFFER_RECOOLDOWN_HOURS = 24
 
 TRANSACTIONS_CHANNEL_ID = 1262200420151984152
 COACHES_CHANNEL_ID      = int(os.getenv("COACHES_CHANNEL_ID", "1274811643338948618"))
@@ -160,15 +165,10 @@ async def init_db():
         """)
 
 _STORE_KEYS = ["players","matches","pending","casual_pending",
-               "suspensions","teams","demand_used","extra_demands","offers"]
+               "suspensions","teams","demand_used","extra_demands","offers",
+               "offer_cooldowns"]
 
 async def load_data():
-    """
-    FIX: previously this fired one SELECT per key (up to 9 separate DB
-    round-trips). Now it's a single round-trip for the whole batch, which
-    is what was causing slow commands to blow past Discord's 3-second
-    interaction-ack window.
-    """
     pool = await get_db()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -182,10 +182,6 @@ async def load_data():
     return data
 
 async def save_data(data):
-    """
-    FIX: previously this fired one INSERT/UPDATE per key sequentially.
-    Now it's a single pipelined batch on one connection.
-    """
     pool = await get_db()
     rows = [(k, json.dumps(v, default=str)) for k, v in data.items()]
     async with pool.acquire() as conn:
@@ -230,7 +226,6 @@ def can_issue_suspension(i):
     return bool({r.id for r in i.user.roles} & SUSPENSION_ALLOWED_ROLE_IDS) or is_admin(i)
 
 def _valid_embed_url(url, *, allow_attachment=False):
-    """Discord only accepts http(s) URLs, or attachment:// when a file is attached."""
     if not url or not isinstance(url, str):
         return None
     url = url.strip()
@@ -289,7 +284,6 @@ async def get_tx_ch(guild):     return await get_ch(guild, TRANSACTIONS_CHANNEL_
 
 # ── BLOXLINK ──────────────────────────────────────────────────────────
 def _parse_bloxlink_body(body):
-    """Extract Roblox ID from Bloxlink v4 response shapes."""
     if not isinstance(body, dict):
         return None
     if body.get("error"):
@@ -303,7 +297,6 @@ def _parse_bloxlink_body(body):
     return str(rid) if rid is not None else None
 
 async def _resolve_roblox_headshot(session, roblox_id):
-    """Fetch the CDN headshot URL from Roblox's thumbnails API."""
     if not roblox_id:
         return None
     api_url = (
@@ -352,7 +345,6 @@ async def _roblox_id_from_username(session, username):
     return None
 
 def _roster_roblox_hint(team, discord_id):
-    """Use saved roster/coach Roblox data when Bloxlink API lookup fails."""
     s = str(discord_id)
     if not team:
         return None, None
@@ -402,7 +394,6 @@ async def bloxlink_lookup(discord_id, guild_id, team=None):
             log.exception("Bloxlink lookup failed for %s", discord_id)
             result = {"error": str(e)}
 
-    # Fallback: roster/coach stored Roblox username or ID
     rbx_name, rbx_id = _roster_roblox_hint(team, discord_id)
     if rbx_id:
         rid = str(rbx_id)
@@ -448,7 +439,6 @@ async def _download_image(session, url):
     return None
 
 async def _fetch_avatar_bytes(session, avatar_url, roblox_id=None):
-    """Download avatar PNG bytes from a CDN URL or resolve via Roblox ID."""
     avatar_url = _valid_embed_url(avatar_url)
     avatar_bytes = await _download_image(session, avatar_url) if avatar_url else None
     if avatar_bytes:
@@ -462,7 +452,6 @@ async def _fetch_avatar_bytes(session, avatar_url, roblox_id=None):
     return avatar_bytes, headshot_url
 
 def _remove_roblox_backdrop(img, tolerance=28):
-    """Remove Roblox's solid black headshot backdrop without eating dark clothing."""
     img = img.convert("RGBA")
     w, h = img.size
     for x, y in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
@@ -472,7 +461,6 @@ def _remove_roblox_backdrop(img, tolerance=28):
     return img
 
 def _make_composite_png(avatar_bytes, logo_bytes, size=256):
-    """Roblox headshot in front with team logo peeking out behind on the right."""
     if not _PIL_OK:
         return None
     avatar = _remove_roblox_backdrop(Image.open(io.BytesIO(avatar_bytes)))
@@ -525,12 +513,6 @@ def _player_tx_line(player, blox):
     return f"{player.mention} (@{player.name})"
 
 async def _apply_tx_images(embed, blox, team, guild):
-    """
-    Transaction thumbnail only (top-right):
-      1. Composite: Roblox headshot over team logo
-      2. Roblox headshot alone
-      3. Team logo
-    """
     logo_url = _team_logo_url(team, guild)
     avatar_url = _valid_embed_url(blox.get("avatar_url", ""))
     roblox_id = blox.get("roblox_id")
@@ -564,7 +546,18 @@ def get_team_for_hc(data, uid):
         if t.get("head_coach_id") == s: return rid, t
     return None, None
 
+def get_team_for_ahc(data, uid):
+    s = str(uid)
+    for rid, t in data["teams"].items():
+        if t.get("ahc_id") == s: return rid, t
+    return None, None
+
 def get_team_for_user(data, uid):
+    """
+    Resolve which team a user is HC or AHC of. Checked first so HCs/AHCs
+    always resolve to their own team — used by /offer and /release so
+    Assistant Head Coaches have full authority to sign and release players.
+    """
     s = str(uid)
     for rid, t in data["teams"].items():
         if t.get("head_coach_id") == s: return rid, t
@@ -593,11 +586,48 @@ def _susp_summary(selected):
     sl = ("**Status:** " + ", ".join(f"`{SPECIAL_SUSPENSION_REASONS[r]}`" for r in sk)) if sk else ""
     return total, rl, sl
 
+# ── OFFER COOLDOWN HELPERS ────────────────────────────────────────────
+def _offer_cd_key(team_role_id: str, player_id: int) -> str:
+    """Composite key so the cooldown is per (team, player) pair, not global."""
+    return f"{team_role_id}:{player_id}"
+
+def has_pending_offer(data: dict, team_role_id: str, player_id: int) -> bool:
+    """True if this team already has an unanswered, non-expired offer out to this player."""
+    key = _offer_cd_key(team_role_id, player_id)
+    for o in data.get("offers", {}).values():
+        if o.get("team_role_id") == team_role_id and o.get("player_id") == str(player_id):
+            return True
+    return False
+
+def get_offer_recooldown_remaining(data: dict, team_role_id: str, player_id: int):
+    """
+    Returns a human-readable remaining-time string if this team is still on
+    cooldown for re-offering this player after a decline/expiry, else None.
+    """
+    key = _offer_cd_key(team_role_id, player_id)
+    ts = data.get("offer_cooldowns", {}).get(key)
+    if not ts:
+        return None
+    expires = datetime.fromisoformat(ts) + timedelta(hours=OFFER_RECOOLDOWN_HOURS)
+    diff = expires - datetime.utcnow()
+    if diff.total_seconds() <= 0:
+        return None
+    h = int(diff.total_seconds() // 3600)
+    m = int((diff.total_seconds() % 3600) // 60)
+    return f"{h}h {m}m"
+
+def set_offer_recooldown(data: dict, team_role_id: str, player_id: int):
+    """Called when an offer is declined or expires — starts the 24h re-offer cooldown."""
+    key = _offer_cd_key(team_role_id, player_id)
+    data.setdefault("offer_cooldowns", {})[key] = datetime.utcnow().isoformat()
+
+def clear_offer_recooldown(data: dict, team_role_id: str, player_id: int):
+    """Called when an offer is accepted — no need to keep a cooldown around."""
+    key = _offer_cd_key(team_role_id, player_id)
+    data.get("offer_cooldowns", {}).pop(key, None)
+
 # ── EMBED BUILDER ─────────────────────────────────────────────────────
 def _info_block(team):
-    """
-    Compact info block with "> " prefix — Discord renders dark left bar.
-    """
     sz = len(team.get("roster",[]))
     hc_id   = team.get("head_coach_id")
     hc_name = team.get("head_coach_name","")
@@ -620,13 +650,6 @@ def _info_block(team):
     return "\n".join(lines)
 
 async def build_tx_embed(action, player, team, team_role, guild, color=UFF_COLOR, blox=None):
-    """
-    Compact transaction embed matching league style:
-      - Description includes player mention + Roblox ID
-      - Thumbnail: Roblox headshot + team logo composite (top-right)
-      - Image: team logo (bottom)
-    Returns (embed, optional discord.File for composite thumbnail).
-    """
     if blox is None:
         blox = await bloxlink_lookup(player.id, guild.id, team=team)
 
@@ -670,7 +693,6 @@ async def build_coach_embed(action, player, team, team_role, guild, color=UFF_CO
     return embed, file
 
 async def post_tx(guild, embed, followup=None, interaction=None, msg="", ephemeral=True, file=None):
-    # Never send attachment:// refs without the matching file attached.
     if embed.thumbnail and embed.thumbnail.url:
         if embed.thumbnail.url.startswith("attachment://") and not file:
             embed.set_thumbnail(url=None)
@@ -721,7 +743,11 @@ class OfferView(discord.ui.View):
 
     async def on_timeout(self):
         for item in self.children: item.disabled=True
-        data=await load_data(); data.get("offers",{}).pop(self.offer_id,None); await save_data(data)
+        # FIX: expiry now also starts the 24h re-offer cooldown for this (team, player) pair.
+        data=await load_data()
+        data.get("offers",{}).pop(self.offer_id,None)
+        set_offer_recooldown(data, self.team_role_id, self.player_id)
+        await save_data(data)
 
     @discord.ui.button(label="✅  Accept",style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -732,9 +758,6 @@ class OfferView(discord.ui.View):
         self.responded=True; self.stop()
         for item in self.children: item.disabled=True
 
-        # FIX: ack immediately (deferred message-update) before any DB/network work,
-        # then edit the original response when everything is ready instead of
-        # racing the 3-second interaction window.
         await interaction.response.defer()
 
         data=await load_data(); guild=bot.get_guild(self.guild_id)
@@ -762,7 +785,10 @@ class OfferView(discord.ui.View):
             "id":str(player.id),"name":player.display_name,"roblox":rbx_name,
             "roblox_id":blox.get("roblox_id"),"role":"Player",
         })
-        data.get("offers",{}).pop(self.offer_id,None); await save_data(data)
+        data.get("offers",{}).pop(self.offer_id,None)
+        # FIX: clear any re-offer cooldown on acceptance — they're on the team now.
+        clear_offer_recooldown(data, rid, self.player_id)
+        await save_data(data)
 
         team_role=guild.get_role(int(rid)); role_str=team_role.mention if team_role else f"**{team['name']}**"
         role_failed=False
@@ -806,7 +832,11 @@ class OfferView(discord.ui.View):
         for item in self.children: item.disabled=True
 
         await interaction.response.defer()
-        data=await load_data(); data.get("offers",{}).pop(self.offer_id,None); await save_data(data)
+        data=await load_data()
+        data.get("offers",{}).pop(self.offer_id,None)
+        # FIX: decline starts the 24h re-offer cooldown for this (team, player) pair.
+        set_offer_recooldown(data, self.team_role_id, self.player_id)
+        await save_data(data)
         e=discord.Embed(title="❌ Offer Declined",
             description=f"You declined the offer from **{self.team_name}**.",color=0xED4245)
         _safe_set_thumbnail(e, _valid_embed_url(self.team_logo))
@@ -818,7 +848,8 @@ class OfferView(discord.ui.View):
                 hc=guild.get_member(int(self.hc_id)) or await guild.fetch_member(int(self.hc_id))
                 tgt=guild.get_member(self.player_id)
                 n=discord.Embed(title="❌ Offer Declined",
-                    description=f"**{tgt.display_name if tgt else 'The player'}** declined your offer to **{self.team_name}**.",color=0xED4245)
+                    description=f"**{tgt.display_name if tgt else 'The player'}** declined your offer to **{self.team_name}**.\n"
+                                f"You can offer them again in {OFFER_RECOOLDOWN_HOURS} hours.",color=0xED4245)
                 n.set_footer(text=UFF_FOOTER); await hc.send(embed=n)
             except: pass
 
@@ -844,7 +875,6 @@ class RankedPickupView(discord.ui.View):
         self.responded=True; self.stop()
         for item in self.children: item.disabled=True
 
-        # FIX: ack first, do the heavy lifting after.
         await interaction.response.defer()
 
         data=await load_data(); guild=bot.get_guild(self.guild_id)
@@ -994,7 +1024,6 @@ class CasualPickupView(discord.ui.View):
             except: pass
 
 async def _run_casual(interaction,opponent,game_link,your_team,opponent_team):
-    # FIX: ack immediately, then do validation/DB work and report via followup.
     await interaction.response.defer(ephemeral=True)
 
     if not ({r.id for r in interaction.user.roles}&PICKUP_ALLOWED_ROLE_IDS) and not is_admin(interaction):
@@ -1071,7 +1100,6 @@ class SuspConfirmBtn(discord.ui.Button):
         if not v.selected:
             await interaction.response.send_message("❌ Select at least one reason.",ephemeral=True); return
 
-        # FIX: ack immediately, then build the embed / hit the DB / post it.
         await interaction.response.defer()
 
         total,rl,sl=_susp_summary(v.selected)
@@ -1141,6 +1169,7 @@ async def on_ready():
     print(f"   Database     : {'SET' if DATABASE_URL else 'NOT SET'}")
     print(f"   Pillow       : {'OK' if _PIL_OK else 'MISSING — pip install Pillow for avatar+logo thumbnails'}")
     print(f"   Demand limit : {'ON (1 lifetime)' if DEMAND_LIMIT_ENABLED else 'OFF (off-season — unlimited)'}")
+    print(f"   Offer re-cooldown: {OFFER_RECOOLDOWN_HOURS}h after decline/expiry")
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1294,6 +1323,21 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
         if str(player.id) in [r["id"] for r in roster]:
             await interaction.followup.send(f"❌ {player.display_name} is already on the team.",ephemeral=True); return
 
+        # FIX: block sending a second offer while one is already pending to this player from this team.
+        if has_pending_offer(data, rid, player.id):
+            await interaction.followup.send(
+                f"❌ **{team['name']}** already has a pending offer out to **{player.display_name}**. "
+                f"Wait for them to accept, decline, or let it expire (12h) before offering again.",
+                ephemeral=True); return
+
+        # FIX: block re-offering within 24h of a decline/expiry from this same team.
+        remaining = get_offer_recooldown_remaining(data, rid, player.id)
+        if remaining:
+            await interaction.followup.send(
+                f"❌ **{team['name']}** can't re-offer **{player.display_name}** yet — "
+                f"they declined or didn't respond to a recent offer. Try again in **{remaining}**.",
+                ephemeral=True); return
+
         oid=f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
         team_logo=_team_logo_url(team, interaction.guild) or ""
         team_emoji=team.get("emoji","")
@@ -1317,7 +1361,7 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
         dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
 
         team_role=get_role(interaction.guild,rid)
-        view=OfferView(oid,int(rid),team["name"],team_logo,team_emoji,hc_id,player.id,interaction.guild.id)
+        view=OfferView(oid,rid,team["name"],team_logo,team_emoji,hc_id,player.id,interaction.guild.id)
         try: await player.send(embed=dm,view=view)
         except discord.Forbidden:
             data.get("offers",{}).pop(oid,None); await save_data(data)
@@ -1333,7 +1377,10 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
 async def release(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     try:
-        data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
+        data=await load_data()
+        # FIX: get_team_for_user() already checks HC first, then AHC — so AHCs always
+        # resolve to their own team here, giving them full release authority.
+        rid,team=get_team_for_user(data,interaction.user.id)
         if not team and not is_staff(interaction):
             await interaction.followup.send("❌ You're not HC or AHC of any team.",ephemeral=True); return
         if not team and is_staff(interaction):
@@ -1511,7 +1558,7 @@ async def demote_coach(interaction:discord.Interaction,player:discord.Member):
         await _cmd_error(interaction, "/demote_coach", e)
 
 
-@bot.tree.command(name="disband",description="Disband a team — removes all players and coaches")
+@bot.tree.command(name="disband",description="Disband a team — removes all players and coaches, deletes the team entirely")
 @app_commands.describe(confirm="Type DISBAND to confirm",
                         team_role="(Staff only) Target team — HCs don't need this")
 async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.Role=None):
@@ -1525,31 +1572,56 @@ async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.
         await interaction.followup.send("❌ Not HC of any team. Staff must also provide team_role.",ephemeral=True); return
 
     team_name=team["name"]; former=list(team.get("roster",[])); former_size=len(former)
-    team.update(roster=[],head_coach_id=None,head_coach_name=None,head_coach_roblox="",
-                ahc_id=None,ahc_name=None,ahc_roblox="")
-    await save_data(data)
+
+    # Collect every Discord ID who needs the team role stripped: full roster
+    # PLUS the HC/AHC even if (for any data reason) they aren't also in roster.
+    strip_ids = {m["id"] for m in former}
+    if team.get("head_coach_id"):
+        strip_ids.add(team["head_coach_id"])
+    if team.get("ahc_id"):
+        strip_ids.add(team["ahc_id"])
 
     tr=get_role(interaction.guild,rid); fail=0
     if tr:
-        for md in former:
+        for member_id in strip_ids:
             try:
-                m=interaction.guild.get_member(int(md["id"])) or await interaction.guild.fetch_member(int(md["id"]))
-                if tr in m.roles: await m.remove_roles(tr,reason=f"{team_name} disbanded")
-            except discord.Forbidden: fail+=1
-            except: pass
+                m=interaction.guild.get_member(int(member_id)) or await interaction.guild.fetch_member(int(member_id))
+                if tr in m.roles:
+                    await m.remove_roles(tr,reason=f"{team_name} disbanded")
+            except discord.Forbidden:
+                fail+=1
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    # FIX: fully delete the team record instead of just clearing its fields.
+    # This means it no longer appears in /coaches, /roster, /offer, /release, etc.
+    # Also purge any pending offers and offer-cooldowns tied to this team so
+    # nothing lingers referencing a team that no longer exists.
+    data["teams"].pop(rid, None)
+    data["offers"] = {
+        oid: o for oid, o in data.get("offers", {}).items()
+        if o.get("team_role_id") != rid
+    }
+    data["offer_cooldowns"] = {
+        k: v for k, v in data.get("offer_cooldowns", {}).items()
+        if not k.startswith(f"{rid}:")
+    }
+    await save_data(data)
 
     embed=discord.Embed(title="team disbanded",color=0xED4245,
-        description=f"**{team_name}** has been disbanded.\nAll **{former_size}** players and coaches removed.")
+        description=(f"**{team_name}** has been disbanded and fully removed from the league.\n"
+                     f"All **{former_size}** player(s) and coaches removed from the roster."))
     if tr: embed.add_field(name="Team",value=tr.mention,inline=True)
     logo=team.get("logo_url","") or _league_thumb(interaction.guild)
     if logo: embed.set_thumbnail(url=logo)
     embed.set_footer(text=f"Disbanded by {interaction.user.display_name} | {UFF_FOOTER}")
     embed.timestamp=datetime.utcnow()
     note=f"\n⚠️ Couldn't strip team role from {fail} member(s)." if fail else ""
+    note+=f"\nNote: the Discord role {tr.mention if tr else '(unknown)'} itself was NOT deleted — use `/set_team` to re-register it later if needed."
     ch=await get_tx_ch(interaction.guild)
     if ch:
         await ch.send(embed=embed)
-        await interaction.followup.send(f"✅ **{team_name}** disbanded. Posted to {ch.mention}.{note}",ephemeral=True)
+        await interaction.followup.send(f"✅ **{team_name}** disbanded and removed. Posted to {ch.mention}.{note}",ephemeral=True)
     else:
         await interaction.followup.send(embed=embed,ephemeral=False)
 
@@ -1866,6 +1938,21 @@ async def clear_cooldown(interaction:discord.Interaction,player:discord.Member):
     await interaction.followup.send(f"✅ Cleared cooldown for **{player.display_name}**.",ephemeral=True)
 
 
+@bot.tree.command(name="clear_offer_cooldown",description="[Admin] Clear a team's re-offer cooldown for a player")
+@app_commands.describe(team_role="The team's Discord role",player="The player whose cooldown to clear")
+@app_commands.default_permissions(administrator=True)
+async def clear_offer_cooldown(interaction:discord.Interaction,team_role:discord.Role,player:discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    if not is_staff(interaction):
+        await interaction.followup.send("❌ Staff only.",ephemeral=True); return
+    data=await load_data()
+    clear_offer_recooldown(data, str(team_role.id), player.id)
+    await save_data(data)
+    await interaction.followup.send(
+        f"✅ Cleared the offer cooldown — {team_role.mention} can immediately re-offer **{player.display_name}**.",
+        ephemeral=True)
+
+
 # ── SUSPENSIONS ───────────────────────────────────────────────────────
 @bot.tree.command(name="suspension",description="[Staff] Issue a suspension to a player")
 @app_commands.describe(player="The player to suspend")
@@ -1914,7 +2001,7 @@ async def help_uff(interaction:discord.Interaction):
         "`/set_team_image` — [Staff] Set team logo URL\n"
         "`/set_team_emoji` — [Staff] Set team emoji for transactions/coaches\n"
         "`/assign_hc` — [Staff] Assign a head coach\n"
-        "`/offer` — [HC/AHC] Send a DM roster offer (12h)\n"
+        "`/offer` — [HC/AHC] Send a DM roster offer (12h, 1 pending per player)\n"
         "`/release` — [HC/AHC/Staff] Release a player\n"
         "`/demand` — Demand your own release"
         + (" (1 lifetime)" if DEMAND_LIMIT_ENABLED else " (unlimited — off-season)")
@@ -1922,9 +2009,10 @@ async def help_uff(interaction:discord.Interaction):
         "`/grant_extra_demand` — [Owner] Grant extra demand token\n"
         "`/promote_coach` — [HC/Staff] Promote to AHC\n"
         "`/demote_coach` — [HC/Staff] Demote AHC\n"
-        "`/disband` — [HC/Staff] Disband a team\n"
+        "`/disband` — [HC/Staff] Disband a team (fully removed from league)\n"
         "`/roster` — View a team's roster\n"
-        "`/coaches` — View all head coaches"
+        "`/coaches` — View all head coaches\n"
+        "`/clear_offer_cooldown` — [Staff] Clear a team's re-offer cooldown for a player"
     ),inline=False)
     embed.add_field(name="⚔️ Ranked Pickup",value=(
         "`/pickup_ranked` — Start a ranked pickup\n"
@@ -1942,6 +2030,11 @@ async def help_uff(interaction:discord.Interaction):
         "⚙️ Iron I/II/III → 0/700/900\n"
         "🥇 Gold I/II/III → 1100/1300/1500\n"
         "💎 Amethyst I/II/III → 1700/1900/2100"
+    ),inline=False)
+    embed.add_field(name="📝 Offer Rules",value=(
+        f"Only **1 pending offer** at a time per (team, player) pair.\n"
+        f"After a decline or 12h expiry, that team must wait **{OFFER_RECOOLDOWN_HOURS}h** "
+        f"before re-offering the same player."
     ),inline=False)
     lt=_league_thumb(interaction.guild)
     if lt: embed.set_thumbnail(url=lt)
