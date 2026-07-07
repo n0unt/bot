@@ -540,30 +540,64 @@ async def _apply_tx_images(embed, blox, team, guild):
 def get_team_by_role(data, role_id):
     return data["teams"].get(str(role_id))
 
-def get_team_for_hc(data, uid):
-    s = str(uid)
-    for rid, t in data["teams"].items():
-        if t.get("head_coach_id") == s: return rid, t
-    return None, None
-
-def get_team_for_ahc(data, uid):
-    s = str(uid)
-    for rid, t in data["teams"].items():
-        if t.get("ahc_id") == s: return rid, t
-    return None, None
-
-def get_team_for_user(data, uid):
+def get_team_for_hc(data, uid, guild=None):
     """
-    Resolve which team a user is HC or AHC of. Checked first so HCs/AHCs
-    always resolve to their own team — used by /offer and /release so
-    Assistant Head Coaches have full authority to sign and release players.
+    Find which team this user is HC of.
+    Primary: stored head_coach_id in DB.
+    Fallback (if guild provided): user has the team's Discord role AND the
+    HEAD_COACH_ROLE_ID role — treats them as HC even if /assign_hc was never
+    used (e.g. they switched Discord accounts and were manually re-roled).
+    When the fallback fires the DB record is NOT mutated here — commands
+    that use this should update it themselves if needed.
     """
     s = str(uid)
     for rid, t in data["teams"].items():
         if t.get("head_coach_id") == s: return rid, t
+
+    if guild:
+        member = guild.get_member(int(uid))
+        if member:
+            member_role_ids = {r.id for r in member.roles}
+            if HEAD_COACH_ROLE_ID in member_role_ids:
+                for rid, t in data["teams"].items():
+                    team_role = guild.get_role(int(rid))
+                    if team_role and team_role in member.roles:
+                        return rid, t
+    return None, None
+
+def get_team_for_ahc(data, uid, guild=None):
+    """
+    Find which team this user is AHC of.
+    Primary: stored ahc_id in DB.
+    Fallback (if guild provided): user has the team's Discord role AND the
+    ASSISTANT_COACH_ROLE_ID role.
+    """
+    s = str(uid)
     for rid, t in data["teams"].items():
         if t.get("ahc_id") == s: return rid, t
+
+    if guild:
+        member = guild.get_member(int(uid))
+        if member:
+            member_role_ids = {r.id for r in member.roles}
+            if ASSISTANT_COACH_ROLE_ID in member_role_ids:
+                for rid, t in data["teams"].items():
+                    team_role = guild.get_role(int(rid))
+                    if team_role and team_role in member.roles:
+                        return rid, t
     return None, None
+
+def get_team_for_user(data, uid, guild=None):
+    """
+    Resolve which team a user is HC or AHC of, with Discord-role fallback.
+    HC is checked before AHC. If guild is provided, also falls back to
+    checking Discord roles so manually re-roled coaches work without
+    needing to re-run /assign_hc.
+    Used by /offer and /release so Assistant Head Coaches have full authority.
+    """
+    rid, t = get_team_for_hc(data, uid, guild=guild)
+    if t: return rid, t
+    return get_team_for_ahc(data, uid, guild=guild)
 
 def get_role(guild, rid_str):
     try: return guild.get_role(int(rid_str))
@@ -1308,7 +1342,7 @@ async def assign_hc(interaction:discord.Interaction,team_role:discord.Role,playe
 async def offer(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     try:
-        data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id)
+        data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id,guild=interaction.guild)
         if not team:
             msg="❌ Staff: assign yourself as HC first." if is_staff(interaction) else "❌ You're not HC or AHC of any team."
             await interaction.followup.send(msg,ephemeral=True); return
@@ -1380,7 +1414,7 @@ async def release(interaction:discord.Interaction,player:discord.Member):
         data=await load_data()
         # FIX: get_team_for_user() already checks HC first, then AHC — so AHCs always
         # resolve to their own team here, giving them full release authority.
-        rid,team=get_team_for_user(data,interaction.user.id)
+        rid,team=get_team_for_user(data,interaction.user.id,guild=interaction.guild)
         if not team and not is_staff(interaction):
             await interaction.followup.send("❌ You're not HC or AHC of any team.",ephemeral=True); return
         if not team and is_staff(interaction):
@@ -1435,14 +1469,41 @@ async def demand(interaction:discord.Interaction):
             else:
                 data.setdefault("demand_used",{})[uid]=True
 
+        # Check if the demanding player is the AHC of this team — if so,
+        # clear the AHC slot from the team record so the spot is truly vacated.
+        was_ahc = found_team.get("ahc_id") == uid
+
         found_team["roster"]=[r for r in found_team.get("roster",[]) if r["id"]!=uid]
+
+        if was_ahc:
+            found_team["ahc_id"] = None
+            found_team["ahc_name"] = None
+            found_team["ahc_roblox"] = ""
+
         await save_data(data)
 
         blox=await bloxlink_lookup(interaction.user.id,interaction.guild.id,team=found_team)
         team_role=get_role(interaction.guild,found_rid); rf=False
+        roles_to_remove = []
+
+        # Always strip the team role.
         if team_role and team_role in interaction.user.roles:
-            try: await interaction.user.remove_roles(team_role,reason=f"Demand release from {found_team['name']}")
-            except discord.Forbidden: rf=True
+            roles_to_remove.append(team_role)
+
+        # If they were AHC, also strip the assistant coach Discord role.
+        if was_ahc:
+            ahc_role = interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
+            if ahc_role and ahc_role in interaction.user.roles:
+                roles_to_remove.append(ahc_role)
+
+        if roles_to_remove:
+            try:
+                await interaction.user.remove_roles(
+                    *roles_to_remove,
+                    reason=f"Demand release from {found_team['name']}"
+                )
+            except discord.Forbidden:
+                rf = True
 
         emoji=found_team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
         role_str=team_role.mention if team_role else f"**{found_team['name']}**"
@@ -1458,6 +1519,7 @@ async def demand(interaction:discord.Interaction):
         file=await _apply_tx_images(embed, blox, found_team, interaction.guild)
 
         msg=f"✅ Your demand from **{found_team['name']}** has been posted."
+        if was_ahc: msg+=" Your Assistant Coach role has been removed."
         if rf: msg+=_role_warn(found_team["name"])
         await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg,file=file)
     except Exception as e:
@@ -1482,7 +1544,7 @@ async def grant_extra_demand(interaction:discord.Interaction,player:discord.Memb
 async def promote_coach(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     try:
-        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
+        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id,guild=interaction.guild)
         if not team and is_staff(interaction):
             for r,t in data["teams"].items():
                 if str(player.id) in [x["id"] for x in t.get("roster",[])]:
@@ -1526,7 +1588,7 @@ async def promote_coach(interaction:discord.Interaction,player:discord.Member):
 async def demote_coach(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     try:
-        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
+        data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id,guild=interaction.guild)
         if not team and is_staff(interaction):
             for r,t in data["teams"].items():
                 if t.get("ahc_id")==str(player.id): rid,team=r,t; break
@@ -1565,7 +1627,7 @@ async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.
     await interaction.response.defer(ephemeral=True)
     if confirm.upper()!="DISBAND":
         await interaction.followup.send("❌ Type `DISBAND` exactly.",ephemeral=True); return
-    data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id)
+    data=await load_data(); rid,team=get_team_for_hc(data,interaction.user.id,guild=interaction.guild)
     if not team and is_staff(interaction) and team_role:
         rid=str(team_role.id); team=get_team_by_role(data,team_role.id)
     if not team:
