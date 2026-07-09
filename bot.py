@@ -661,14 +661,111 @@ def clear_offer_recooldown(data: dict, team_role_id: str, player_id: int):
     data.get("offer_cooldowns", {}).pop(key, None)
 
 # ── EMBED BUILDER ─────────────────────────────────────────────────────
-def _info_block(team):
-    sz = len(team.get("roster",[]))
+def resolve_live_roster(team: dict, team_role, guild) -> dict:
+    """
+    Returns a merged view of the team that combines:
+      - The DB roster (people added via /offer)
+      - Everyone in the guild who currently has the team's Discord role
+        (catches people who switched accounts or were manually re-roled)
+    Also resolves HC and AHC from Discord roles if not set in the DB,
+    so /roster and /coaches always reflect reality.
+
+    Returns a dict with keys:
+      hc_id, hc_name, ahc_id, ahc_name, players (list of {id, name, role})
+      roster_size (live count from Discord role members)
+    """
+    db_roster = {r["id"]: r for r in team.get("roster", [])}
+
+    # Build live member set from the Discord role
+    live_members: dict[str, discord.Member] = {}
+    if team_role and guild:
+        for m in guild.members:
+            if team_role in m.roles:
+                live_members[str(m.id)] = m
+
+    # Merge: everyone in live_members should appear; DB entries not in live
+    # set are still shown (they may have left the server, keep them visible).
+    merged: dict[str, dict] = {}
+    for mid, entry in db_roster.items():
+        merged[mid] = dict(entry)  # copy
+    for mid, member in live_members.items():
+        if mid not in merged:
+            merged[mid] = {
+                "id": mid,
+                "name": member.display_name,
+                "roblox": "",
+                "role": "Player",
+            }
+
+    # Resolve HC — DB first, then Discord role fallback
     hc_id   = team.get("head_coach_id")
-    hc_name = team.get("head_coach_name","")
-    hc_rbx  = team.get("head_coach_roblox","")
+    hc_name = team.get("head_coach_name", "")
     ahc_id  = team.get("ahc_id")
-    ahc_name= team.get("ahc_name","")
-    ahc_rbx = team.get("ahc_roblox","")
+    ahc_name= team.get("ahc_name", "")
+
+    if not hc_id and guild and team_role:
+        hc_role_obj = guild.get_role(HEAD_COACH_ROLE_ID)
+        if hc_role_obj:
+            for mid, member in live_members.items():
+                if hc_role_obj in member.roles:
+                    hc_id   = mid
+                    hc_name = member.display_name
+                    # Tag them as Head Coach in merged view
+                    if mid in merged:
+                        merged[mid]["role"] = "Head Coach"
+                    break
+
+    if not ahc_id and guild and team_role:
+        ahc_role_obj = guild.get_role(ASSISTANT_COACH_ROLE_ID)
+        if ahc_role_obj:
+            for mid, member in live_members.items():
+                if ahc_role_obj in member.roles and mid != hc_id:
+                    ahc_id   = mid
+                    ahc_name = member.display_name
+                    if mid in merged:
+                        merged[mid]["role"] = "Assistant Head Coach"
+                    break
+
+    # Tag DB-known HC/AHC in merged so they render in the right section
+    if hc_id and hc_id in merged:
+        merged[hc_id]["role"] = "Head Coach"
+    if ahc_id and ahc_id in merged:
+        merged[ahc_id]["role"] = "Assistant Head Coach"
+
+    return {
+        "hc_id":       hc_id,
+        "hc_name":     hc_name,
+        "hc_rbx":      team.get("head_coach_roblox", ""),
+        "ahc_id":      ahc_id,
+        "ahc_name":    ahc_name,
+        "ahc_rbx":     team.get("ahc_roblox", ""),
+        "roster_size": len(live_members) if live_members else len(team.get("roster", [])),
+        "players":     list(merged.values()),
+    }
+
+
+def _info_block(team, live=None):
+    """
+    Compact info block for transaction embeds.
+    Pass live=resolve_live_roster(...) to show accurate counts/coaches;
+    otherwise falls back to DB-only data.
+    """
+    if live:
+        sz       = live["roster_size"]
+        hc_id    = live["hc_id"]
+        hc_name  = live["hc_name"]
+        hc_rbx   = live["hc_rbx"]
+        ahc_id   = live["ahc_id"]
+        ahc_name = live["ahc_name"]
+        ahc_rbx  = live["ahc_rbx"]
+    else:
+        sz       = len(team.get("roster", []))
+        hc_id    = team.get("head_coach_id")
+        hc_name  = team.get("head_coach_name", "")
+        hc_rbx   = team.get("head_coach_roblox", "")
+        ahc_id   = team.get("ahc_id")
+        ahc_name = team.get("ahc_name", "")
+        ahc_rbx  = team.get("ahc_roblox", "")
 
     lines = [f"> roster: {sz}/{MAX_ROSTER}"]
     if hc_id:
@@ -1697,28 +1794,45 @@ async def roster_cmd(interaction:discord.Interaction,team_role:discord.Role):
         if not team:
             await interaction.followup.send(f"❌ {team_role.mention} isn't registered.",ephemeral=True); return
 
-        roster=team.get("roster",[]); color=team.get("color",UFF_COLOR)
-        emoji=team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
-        embed=discord.Embed(title=f"{prefix}{team['name'].lower()} roster",
-                            description=f"> roster: **{len(roster)}/{MAX_ROSTER}**",color=color)
+        # Resolve live roster: merges DB + everyone currently holding the team role,
+        # and detects HC/AHC from Discord roles even if never set through the bot.
+        live = resolve_live_roster(team, team_role, interaction.guild)
 
-        hc_id=team.get("head_coach_id")
-        if hc_id:
-            rbx=f" `{team.get('head_coach_roblox','')}`" if team.get("head_coach_roblox") else ""
-            embed.add_field(name="head coach:",
-                value=f"> <@{hc_id}> (@{team.get('head_coach_name','')}) ✓{rbx}",inline=False)
+        color=team.get("color",UFF_COLOR)
+        emoji=team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
+        embed=discord.Embed(
+            title=f"{prefix}{team['name'].lower()} roster",
+            description=f"> roster: **{live['roster_size']}/{MAX_ROSTER}**",
+            color=color
+        )
+
+        if live["hc_id"]:
+            rbx = f" `{live['hc_rbx']}`" if live["hc_rbx"] else ""
+            embed.add_field(
+                name="head coach:",
+                value=f"> <@{live['hc_id']}> (@{live['hc_name']}) ✓{rbx}",
+                inline=False
+            )
 
         ahc_lines=[]; pl_lines=[]
-        for r in roster:
-            rbx=f" `{r['roblox']}`" if r.get("roblox") else ""
-            line=f"> <@{r['id']}> (@{r['name']}) ✓{rbx}"
-            role=r.get("role","Player")
-            if role=="Assistant Head Coach": ahc_lines.append(line)
-            elif role!="Head Coach": pl_lines.append(line)
+        for r in live["players"]:
+            # Skip the HC row — already shown in the field above
+            if r["id"] == live["hc_id"]:
+                continue
+            rbx = f" `{r['roblox']}`" if r.get("roblox") else ""
+            line = f"> <@{r['id']}> (@{r['name']}) ✓{rbx}" if rbx else f"> <@{r['id']}> (@{r['name']})"
+            role = r.get("role","Player")
+            if role == "Assistant Head Coach":
+                ahc_lines.append(line)
+            else:
+                pl_lines.append(line)
 
-        if ahc_lines: embed.add_field(name="assistant head coach:",value="\n".join(ahc_lines),inline=False)
-        if pl_lines:  embed.add_field(name="players:",value="\n".join(pl_lines),inline=False)
-        elif not roster: embed.add_field(name="players:",value="> *No players yet.*",inline=False)
+        if ahc_lines:
+            embed.add_field(name="assistant head coach:",value="\n".join(ahc_lines),inline=False)
+        if pl_lines:
+            embed.add_field(name="players:",value="\n".join(pl_lines),inline=False)
+        elif not live["players"]:
+            embed.add_field(name="players:",value="> *No players yet.*",inline=False)
 
         logo=_team_logo_url(team, interaction.guild) or _league_thumb(interaction.guild)
         _safe_set_thumbnail(embed, logo)
@@ -1740,10 +1854,25 @@ async def coaches_cmd(interaction:discord.Interaction):
     else:
         lines=[]
         for rid,team in teams.items():
-            hc_id=team.get("head_coach_id")
-            hc_name=team.get("head_coach_name","")
-            hc_rbx=team.get("head_coach_roblox","")
             team_emoji=team.get("emoji","")
+            tr=get_role(interaction.guild,rid)
+            role_mention=tr.mention if tr else team["name"]
+            emoji_prefix=f"{team_emoji} " if team_emoji else ""
+
+            # Resolve HC live: DB first, then Discord role fallback so
+            # manually re-roled coaches always appear here.
+            hc_id   = team.get("head_coach_id")
+            hc_name = team.get("head_coach_name","")
+            hc_rbx  = team.get("head_coach_roblox","")
+
+            if not hc_id and tr and interaction.guild:
+                hc_role_obj = interaction.guild.get_role(HEAD_COACH_ROLE_ID)
+                if hc_role_obj:
+                    for member in interaction.guild.members:
+                        if tr in member.roles and hc_role_obj in member.roles:
+                            hc_id   = str(member.id)
+                            hc_name = member.display_name
+                            break
 
             if hc_id:
                 rbx_str=f" `{hc_rbx}`" if hc_rbx else ""
@@ -1751,9 +1880,6 @@ async def coaches_cmd(interaction:discord.Interaction):
             else:
                 hc_str="*vacant*"
 
-            tr=get_role(interaction.guild,rid)
-            role_mention=tr.mention if tr else team["name"]
-            emoji_prefix=f"{team_emoji} " if team_emoji else ""
             lines.append(f"{emoji_prefix}{role_mention} — {hc_str}")
 
         chunks=[]; cur=""
