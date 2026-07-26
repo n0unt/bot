@@ -2341,7 +2341,7 @@ async def thread_create(interaction: discord.Interaction,
                                         ephemeral=True); return
 
     # ── Collect members to add ─────────────────────────────────────
-    to_add: set[discord.Member] = set()
+    to_add = set()  # set of discord.Member
 
     # HCs and AHCs from the DB for both teams
     coach_ids = [
