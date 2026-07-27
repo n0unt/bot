@@ -329,8 +329,18 @@ def get_team_for_user(data, uid):
         if t.get("ahc_id") == s: return rid, t
     return None, None
 
-def get_player_team(data, uid):
-    """Return (rid, team) for whichever team uid is on, or (None, None)."""
+def get_player_team(data, uid, member=None):
+    """
+    Find what team a player is on.
+    Checks Discord roles FIRST (source of truth — staff often manually
+    assign roles outside the bot), then falls back to the system DB roster.
+    Pass member (a discord.Member) whenever available.
+    """
+    if member is not None:
+        role_ids = {str(r.id) for r in member.roles}
+        for rid, team in data["teams"].items():
+            if rid in role_ids:
+                return rid, team
     s = str(uid)
     for rid, t in data["teams"].items():
         if any(r["id"] == s for r in t.get("roster", [])):
@@ -372,12 +382,12 @@ def _info_block(team):
 
     lines = [f"> roster: {sz}/{MAX_ROSTER}"]
     if hc_id:
-        rbx = f" `{hc_rbx}`" if hc_rbx else ""
+        rbx = f" {hc_rbx}" if hc_rbx else ""
         lines.append(f"> head coach: <@{hc_id}> (@{hc_name}) ✓{rbx}")
     else:
         lines.append("> head coach: vacant")
     if ahc_id:
-        rbx = f" `{ahc_rbx}`" if ahc_rbx else ""
+        rbx = f" {ahc_rbx}" if ahc_rbx else ""
         lines.append(f"> assistant coach: <@{ahc_id}> (@{ahc_name}) ✓{rbx}")
     else:
         lines.append("> assistant coach: vacant")
@@ -503,8 +513,8 @@ class OfferView(discord.ui.View):
             await interaction.edit_original_response(
                 content="❌ Team no longer exists.", view=self); return
 
-        # Block if already on any other team
-        cur_rid, cur_team = get_player_team(data, interaction.user.id)
+        # Block if already on any other team — check roles first
+        cur_rid, cur_team = get_player_team(data, interaction.user.id, player)
         if cur_team and cur_rid != rid:
             await interaction.edit_original_response(
                 content=(f"❌ You're already on **{cur_team['name']}**. "
@@ -1316,6 +1326,15 @@ async def assign_hc(interaction: discord.Interaction,
 
     blox = await bloxlink_lookup(player.id, interaction.guild.id)
     rbx  = blox.get("roblox_username", "")
+
+    # Clear this player's HC slot on any OTHER team first so they don't
+    # appear as HC of two teams at once.
+    for other_rid, other_team in data["teams"].items():
+        if other_rid != rid and other_team.get("head_coach_id") == str(player.id):
+            other_team["head_coach_id"]     = None
+            other_team["head_coach_name"]   = None
+            other_team["head_coach_roblox"] = ""
+
     team = data["teams"][rid]
     team.update(head_coach_id=str(player.id),
                 head_coach_name=player.name, head_coach_roblox=rbx)
@@ -1359,7 +1378,7 @@ async def offer(interaction: discord.Interaction, player: discord.Member):
         await interaction.followup.send(
             f"❌ Roster cap ({MAX_ROSTER}) reached.", ephemeral=True); return
 
-    cur_rid, cur_team = get_player_team(data, player.id)
+    cur_rid, cur_team = get_player_team(data, player.id, player)
     if cur_team:
         await interaction.followup.send(
             f"❌ **{player.display_name}** is already on **{cur_team['name']}**. "
@@ -1419,21 +1438,18 @@ async def release(interaction: discord.Interaction, player: discord.Member):
         await interaction.followup.send(
             "❌ You're not HC or AHC of any team.", ephemeral=True); return
     if not team and is_staff(interaction):
-        for r, t in data["teams"].items():
-            if any(x["id"] == str(player.id) for x in t.get("roster", [])):
-                rid, team = r, t; break
+        # Check Discord roles first, then DB
+        rid, team = get_player_team(data, player.id, player)
         if not team:
             await interaction.followup.send(
                 f"❌ {player.display_name} isn't on any registered team.",
                 ephemeral=True); return
 
-    roster = team.setdefault("roster", [])
-    before = len(roster)
-    team["roster"] = [r for r in roster if r["id"] != str(player.id)]
-    if len(team["roster"]) == before:
-        await interaction.followup.send(
-            f"❌ {player.display_name} isn't on **{team['name']}**.",
-            ephemeral=True); return
+    # Remove player from ALL team rosters in the DB so stale entries don't linger
+    for t in data["teams"].values():
+        t["roster"] = [r for r in t.get("roster", []) if r["id"] != str(player.id)]
+
+    # Use found team for the transaction embed
     await save_data(data)
 
     team_role = get_role(interaction.guild, rid); rf = False
@@ -1453,13 +1469,15 @@ async def release(interaction: discord.Interaction, player: discord.Member):
 async def demand(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     data = await load_data(); uid = str(interaction.user.id)
-    found_rid, found_team = None, None
-    for r, t in data["teams"].items():
-        if any(x["id"] == uid for x in t.get("roster", [])):
-            found_rid, found_team = r, t; break
+
+    # Role-first lookup — handles players who were manually role-assigned
+    # outside the bot and whose DB entry may point to the wrong team.
+    found_rid, found_team = get_player_team(data, uid, interaction.user)
     if not found_team:
         await interaction.followup.send(
-            "❌ You aren't on any registered team.", ephemeral=True); return
+            "❌ You aren't on any registered team. "
+            "If you have a team role but this is failing, ask staff to run `/sync_roster`.",
+            ephemeral=True); return
 
     extra = data.get("extra_demands", {}).get(uid, 0)
     if data.get("demand_used", {}).get(uid, False) and extra <= 0:
@@ -1473,7 +1491,9 @@ async def demand(interaction: discord.Interaction):
     else:
         data.setdefault("demand_used", {})[uid] = True
 
-    found_team["roster"] = [r for r in found_team.get("roster", []) if r["id"] != uid]
+    # Remove player from ALL team rosters so stale DB entries don't linger
+    for t in data["teams"].values():
+        t["roster"] = [r for r in t.get("roster", []) if r["id"] != uid]
     await save_data(data)
 
     blox       = await bloxlink_lookup(interaction.user.id, interaction.guild.id)
@@ -1796,17 +1816,16 @@ async def stream_post(
             "❌ Stream channel not found. Check STREAM_CHANNEL_ID.", ephemeral=True)
         return
 
-    # Plain text message — Discord auto-embeds the stream URL.
-    # Matches the format shown in the screenshot exactly.
+    # Plain text — Discord auto-embeds the stream URL preview.
     content = (
-        f"<@&{STREAM_PING_ROLE_ID}>\n"
+        f"@here\n"
         f"**Season {season} - Series {series}**\n"
         f"{team1.mention} ({team1_record}) vs {team2.mention} ({team2_record})\n"
         f"{stream_url}"
     )
     await ch.send(
         content=content,
-        allowed_mentions=discord.AllowedMentions(roles=True),
+        allowed_mentions=discord.AllowedMentions(everyone=True, roles=True),
     )
     await interaction.followup.send(
         f"✅ Stream post sent to {ch.mention}!", ephemeral=True)
