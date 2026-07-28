@@ -321,12 +321,26 @@ def get_team_for_hc(data, uid):
         if t.get("head_coach_id") == s: return rid, t
     return None, None
 
-def get_team_for_user(data, uid):
+def get_team_for_user(data, uid, member=None):
+    """
+    Find what team this user manages as HC or AHC.
+    DB-first; if not found (e.g. they were manually given the HC/AHC role
+    without going through the bot), fall back to checking which team role
+    they have in Discord.
+    """
     s = str(uid)
     for rid, t in data["teams"].items():
         if t.get("head_coach_id") == s: return rid, t
     for rid, t in data["teams"].items():
         if t.get("ahc_id") == s: return rid, t
+    # Role-based fallback — handles manual role assignments
+    if member is not None:
+        coach_role_ids = {HEAD_COACH_ROLE_ID, ASSISTANT_COACH_ROLE_ID}
+        if any(r.id in coach_role_ids for r in member.roles):
+            role_ids = {str(r.id) for r in member.roles}
+            for rid, team in data["teams"].items():
+                if rid in role_ids:
+                    return rid, team
     return None, None
 
 def get_player_team(data, uid, member=None):
@@ -414,12 +428,16 @@ def _coach_desc(prefix, role_str, action, player, rbx_name, role_lbl, team):
     )
 
 def _apply_tx_images(embed, rbx_avatar, team, guild):
-    if rbx_avatar:              embed.set_thumbnail(url=rbx_avatar)
-    elif team.get("logo_url"):  embed.set_thumbnail(url=team["logo_url"])
+    # Roblox headshot as thumbnail (top-right).  If no headshot, fall back
+    # to team logo, then league logo.  No large bottom image — it was
+    # making embeds look chunky.
+    if rbx_avatar:
+        embed.set_thumbnail(url=rbx_avatar)
+    elif team.get("logo_url"):
+        embed.set_thumbnail(url=team["logo_url"])
     else:
         lt = _league_thumb(guild)
         if lt: embed.set_thumbnail(url=lt)
-    if team.get("logo_url"):    embed.set_image(url=team["logo_url"])
 
 async def build_tx_embed(action, player, team, team_role, guild, color=UFF_COLOR):
     blox      = await bloxlink_lookup(player.id, guild.id)
@@ -1278,7 +1296,7 @@ async def set_team_emoji(interaction: discord.Interaction,
 
 
 @bot.tree.command(name="sync_roster",
-                  description="[Staff] Import all role-members into the system roster")
+                  description="[Staff] Fully sync the roster to match who actually has the team role")
 @app_commands.describe(team_role="The team's Discord role to sync from")
 @app_commands.default_permissions(administrator=True)
 async def sync_roster(interaction: discord.Interaction, team_role: discord.Role):
@@ -1290,21 +1308,54 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
         await interaction.followup.send(
             f"❌ {team_role.mention} not registered.", ephemeral=True); return
 
-    team        = data["teams"][rid]
-    roster      = team.setdefault("roster", [])
-    existing_ids= {r["id"] for r in roster}
-    added       = 0
+    team     = data["teams"][rid]
+    old_ids  = {r["id"] for r in team.get("roster", [])}
+    old_data = {r["id"]: r for r in team.get("roster", [])}
+
+    # REPLACE roster entirely with whoever currently has the role
+    new_roster = []
     for member in team_role.members:
-        if str(member.id) not in existing_ids:
-            roster.append({"id": str(member.id), "name": member.display_name,
-                           "roblox": "", "role": "Player"})
-            existing_ids.add(str(member.id))
-            added += 1
+        mid = str(member.id)
+        if mid in old_data:
+            # Preserve existing roblox name and role label
+            new_roster.append(old_data[mid])
+        else:
+            new_roster.append({"id": mid, "name": member.display_name,
+                               "roblox": "", "role": "Player"})
+    team["roster"] = new_roster
+
+    new_ids  = {str(m.id) for m in team_role.members}
+    added    = len(new_ids - old_ids)
+    removed  = len(old_ids - new_ids)
+
+    # Clear HC if they no longer have the team role
+    hc_id = team.get("head_coach_id")
+    hc_cleared = False
+    if hc_id:
+        hc_m = interaction.guild.get_member(int(hc_id))
+        if not hc_m or team_role not in hc_m.roles:
+            team.update(head_coach_id=None, head_coach_name=None, head_coach_roblox="")
+            hc_cleared = True
+
+    # Clear AHC if they no longer have the team role
+    ahc_id = team.get("ahc_id")
+    ahc_cleared = False
+    if ahc_id:
+        ahc_m = interaction.guild.get_member(int(ahc_id))
+        if not ahc_m or team_role not in ahc_m.roles:
+            team.update(ahc_id=None, ahc_name=None, ahc_roblox="")
+            ahc_cleared = True
+
     await save_data(data)
+
+    notes = []
+    if hc_cleared:  notes.append("⚠️ Head coach cleared (no longer has the role)")
+    if ahc_cleared: notes.append("⚠️ AHC cleared (no longer has the role)")
+    note_str = "\n" + "\n".join(notes) if notes else ""
+
     await interaction.followup.send(
-        f"✅ Synced **{team['name']}** — imported **{added}** new member(s).\n"
-        f"Roster: **{len(roster)}/{MAX_ROSTER}**\n"
-        f"*(Roblox names blank for imported members — filled on next transaction.)*",
+        f"✅ **{team['name']}** roster replaced with current role members.\n"
+        f"**{len(new_roster)}/{MAX_ROSTER}** members | +{added} added | -{removed} removed{note_str}",
         ephemeral=True,
     )
 
@@ -1363,7 +1414,7 @@ async def assign_hc(interaction: discord.Interaction,
 async def offer(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer(ephemeral=True)
     data      = await load_data()
-    rid, team = get_team_for_user(data, interaction.user.id)
+    rid, team = get_team_for_user(data, interaction.user.id, interaction.user)
     if not team:
         msg = ("❌ Staff: assign yourself as HC first."
                if is_staff(interaction) else "❌ You're not HC or AHC of any team.")
@@ -1432,32 +1483,43 @@ async def offer(interaction: discord.Interaction, player: discord.Member):
 async def release(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer(ephemeral=True, thinking=True)
     data      = await load_data()
-    rid, team = get_team_for_user(data, interaction.user.id)
+    rid, team = get_team_for_user(data, interaction.user.id, interaction.user)
 
     if not team and not is_staff(interaction):
         await interaction.followup.send(
             "❌ You're not HC or AHC of any team.", ephemeral=True); return
+
     if not team and is_staff(interaction):
-        # Check Discord roles first, then DB
+        # Staff: find the player's team by role first, then DB
         rid, team = get_player_team(data, player.id, player)
         if not team:
             await interaction.followup.send(
                 f"❌ {player.display_name} isn't on any registered team.",
                 ephemeral=True); return
 
-    # Remove player from ALL team rosters in the DB so stale entries don't linger
+    # Confirm the player is actually on this team — role OR DB entry
+    team_role_obj = get_role(interaction.guild, rid)
+    in_db   = any(r["id"] == str(player.id) for r in team.get("roster", []))
+    has_role = team_role_obj is not None and team_role_obj in player.roles
+
+    if not in_db and not has_role:
+        await interaction.followup.send(
+            f"❌ {player.display_name} isn't on **{team['name']}** "
+            f"(not in the roster and doesn't have the team role).",
+            ephemeral=True); return
+
+    # Remove from ALL team rosters in DB (cleans up any stale entries too)
     for t in data["teams"].values():
         t["roster"] = [r for r in t.get("roster", []) if r["id"] != str(player.id)]
-
-    # Use found team for the transaction embed
     await save_data(data)
 
-    team_role = get_role(interaction.guild, rid); rf = False
-    if team_role and team_role in player.roles:
-        try:   await player.remove_roles(team_role, reason=f"Released from {team['name']}")
+    # Remove the team role
+    rf = False
+    if team_role_obj and team_role_obj in player.roles:
+        try:   await player.remove_roles(team_role_obj, reason=f"Released from {team['name']}")
         except discord.Forbidden: rf = True
 
-    embed = await build_tx_embed("released", player, team, team_role,
+    embed = await build_tx_embed("released", player, team, team_role_obj,
                                  interaction.guild, color=0xED4245)
     msg = f"✅ Released **{player.display_name}** from **{team['name']}**."
     if rf: msg += _role_warn(team["name"])
@@ -1522,7 +1584,6 @@ async def demand(interaction: discord.Interaction):
     embed.set_footer(text=UFF_FOOTER); embed.timestamp = datetime.utcnow()
     if rbx_avatar:                   embed.set_thumbnail(url=rbx_avatar)
     elif found_team.get("logo_url"): embed.set_thumbnail(url=found_team["logo_url"])
-    if found_team.get("logo_url"):   embed.set_image(url=found_team["logo_url"])
 
     msg = f"✅ Your demand from **{found_team['name']}** has been posted."
     if rf: msg += _role_warn(found_team["name"])
