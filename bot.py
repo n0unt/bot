@@ -1346,15 +1346,44 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
             team.update(ahc_id=None, ahc_name=None, ahc_roblox="")
             ahc_cleared = True
 
+    # Auto-detect HC and AHC from Discord roles.
+    # Anyone who has the team role AND the HC/AHC league role is the coach
+    # of this team — even if they were never assigned through the bot.
+    hc_role_obj  = interaction.guild.get_role(HEAD_COACH_ROLE_ID)
+    ahc_role_obj = interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
+    hc_detected = False; ahc_detected = False
+    for member in team_role.members:
+        mid = str(member.id)
+        if hc_role_obj and hc_role_obj in member.roles and not hc_detected:
+            team["head_coach_id"]     = mid
+            team["head_coach_name"]   = member.name
+            if not team.get("head_coach_roblox"):
+                team["head_coach_roblox"] = ""
+            hc_detected = True
+            hc_cleared  = False   # override the "cleared" flag — we found a new one
+            for r in team["roster"]:
+                if r["id"] == mid: r["role"] = "Head Coach"
+        elif ahc_role_obj and ahc_role_obj in member.roles and not ahc_detected:
+            team["ahc_id"]   = mid
+            team["ahc_name"] = member.name
+            if not team.get("ahc_roblox"):
+                team["ahc_roblox"] = ""
+            ahc_detected = True
+            ahc_cleared  = False
+            for r in team["roster"]:
+                if r["id"] == mid: r["role"] = "Assistant Head Coach"
+
     await save_data(data)
 
     notes = []
-    if hc_cleared:  notes.append("⚠️ Head coach cleared (no longer has the role)")
-    if ahc_cleared: notes.append("⚠️ AHC cleared (no longer has the role)")
+    if hc_detected:  notes.append("✅ Head coach auto-detected from role")
+    if ahc_detected: notes.append("✅ AHC auto-detected from role")
+    if hc_cleared:   notes.append("⚠️ Head coach cleared (no longer has the team role)")
+    if ahc_cleared:  notes.append("⚠️ AHC cleared (no longer has the team role)")
     note_str = "\n" + "\n".join(notes) if notes else ""
 
     await interaction.followup.send(
-        f"✅ **{team['name']}** roster replaced with current role members.\n"
+        f"✅ **{team['name']}** roster synced to current role members.\n"
         f"**{len(new_roster)}/{MAX_ROSTER}** members | +{added} added | -{removed} removed{note_str}",
         ephemeral=True,
     )
