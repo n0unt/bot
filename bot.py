@@ -1,25 +1,10 @@
 """
 UFF Discord Bot — United Flag Football League
-v5 changelog:
-
-  - FIX (cooldown): Cooldown now starts the moment a challenge is SENT
-    (/pickup_ranked or casual), not when it's accepted.  Submitting results
-    via /pickup_results no longer resets or extends the timer — once the
-    original cooldown expires you can post again regardless of whether
-    results have been submitted.  The opponent gets their own cooldown when
-    they ACCEPT a challenge (so they also can't immediately spam).
-  - FIX (Railway crash): Added a global slash-command error handler so any
-    unhandled exception in a command is caught and reported to the user
-    instead of propagating and crashing the process.  Also added DB retry
-    logic — if the asyncpg pool drops (Railway sometimes recycles the DB
-    connection), the next request automatically recreates it instead of
-    raising an unhandled exception.
-  - FIX (pending ghost entries): stale pending entries older than
-    COOLDOWN_MINUTES are cleaned up on every /pickup_ranked call so a
-    dropped view timeout can never permanently block a user.
-  - KEPT from v4: inline embed format, stream_post, sync_roster,
-    one-team-at-a-time offer check, suspension role, batched DB,
-    defer-first on every command.
+v5.1 changelog:
+  - FIX (offer accept crash): OfferView.accept referenced `player` before
+    it was fetched from the guild, causing a NameError → "Interaction Failed".
+    Reordered so the member is fetched FIRST, then used in get_player_team check.
+  - All other v5 behaviour preserved unchanged.
 """
 
 import discord
@@ -125,12 +110,6 @@ TEAMS = [
 _db_pool = None
 
 async def get_db():
-    """
-    Return the connection pool, (re)creating it if it has been closed or
-    was never initialised.  Railway sometimes recycles the Postgres
-    connection; the retry here means the next request silently reconnects
-    instead of crashing the bot.
-    """
     global _db_pool
     if _db_pool is None or getattr(_db_pool, "_closed", False):
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -165,7 +144,7 @@ async def load_data():
             return data
         except Exception as e:
             print(f"[DB] load_data error (attempt {attempt+1}): {e}")
-            _db_pool = None          # force pool recreation on next call
+            _db_pool = None
             if attempt == 1:
                 raise
 
@@ -250,11 +229,6 @@ async def get_tx_ch(guild):     return await get_ch(guild, TRANSACTIONS_CHANNEL_
 async def get_stream_ch(guild): return await get_ch(guild, STREAM_CHANNEL_ID)
 
 def _expire_pending(data):
-    """
-    Remove any pending ranked challenges older than 30 minutes so stale
-    entries from bot restarts / dropped view timeouts don't permanently
-    block users from sending new challenges.
-    """
     cutoff = datetime.utcnow() - timedelta(minutes=COOLDOWN_MINUTES)
     stale  = [k for k, m in data.get("pending", {}).items()
                if _ts(m.get("timestamp")) < cutoff]
@@ -322,18 +296,11 @@ def get_team_for_hc(data, uid):
     return None, None
 
 def get_team_for_user(data, uid, member=None):
-    """
-    Find what team this user manages as HC or AHC.
-    DB-first; if not found (e.g. they were manually given the HC/AHC role
-    without going through the bot), fall back to checking which team role
-    they have in Discord.
-    """
     s = str(uid)
     for rid, t in data["teams"].items():
         if t.get("head_coach_id") == s: return rid, t
     for rid, t in data["teams"].items():
         if t.get("ahc_id") == s: return rid, t
-    # Role-based fallback — handles manual role assignments
     if member is not None:
         coach_role_ids = {HEAD_COACH_ROLE_ID, ASSISTANT_COACH_ROLE_ID}
         if any(r.id in coach_role_ids for r in member.roles):
@@ -344,12 +311,6 @@ def get_team_for_user(data, uid, member=None):
     return None, None
 
 def get_player_team(data, uid, member=None):
-    """
-    Find what team a player is on.
-    Checks Discord roles FIRST (source of truth — staff often manually
-    assign roles outside the bot), then falls back to the system DB roster.
-    Pass member (a discord.Member) whenever available.
-    """
     if member is not None:
         role_ids = {str(r.id) for r in member.roles}
         for rid, team in data["teams"].items():
@@ -408,10 +369,6 @@ def _info_block(team):
     return "\n".join(lines)
 
 def _tx_desc(prefix, role_str, action, player, rbx_name, team):
-    """
-    Old-style inline description — Roblox name on the same line, no backticks.
-    e.g.  🦬 @Laredo Longhorns have released @fearing (@freepolicys) 2544210043!
-    """
     rbx = f" {rbx_name}" if rbx_name and rbx_name != "Unknown" else ""
     return (
         f"{prefix}{role_str} have **{action.lower()}** "
@@ -428,9 +385,6 @@ def _coach_desc(prefix, role_str, action, player, rbx_name, role_lbl, team):
     )
 
 def _apply_tx_images(embed, rbx_avatar, team, guild):
-    # Roblox headshot as thumbnail (top-right).  If no headshot, fall back
-    # to team logo, then league logo.  No large bottom image — it was
-    # making embeds look chunky.
     if rbx_avatar:
         embed.set_thumbnail(url=rbx_avatar)
     elif team.get("logo_url"):
@@ -531,8 +485,16 @@ class OfferView(discord.ui.View):
             await interaction.edit_original_response(
                 content="❌ Team no longer exists.", view=self); return
 
-        # Block if already on any other team — check roles first
-        cur_rid, cur_team = get_player_team(data, interaction.user.id, player)
+        # ── FIX: fetch the member FIRST so it's available for all checks ──
+        try:
+            player = (guild.get_member(self.player_id)
+                      or await guild.fetch_member(self.player_id))
+        except discord.NotFound:
+            await interaction.edit_original_response(
+                content="❌ Couldn't find you in the server.", view=self); return
+
+        # Now safe to use `player` in get_player_team
+        cur_rid, cur_team = get_player_team(data, player.id, player)
         if cur_team and cur_rid != rid:
             await interaction.edit_original_response(
                 content=(f"❌ You're already on **{cur_team['name']}**. "
@@ -543,16 +505,9 @@ class OfferView(discord.ui.View):
         if len(roster) >= MAX_ROSTER:
             await interaction.edit_original_response(
                 content=f"❌ Roster cap ({MAX_ROSTER}) reached.", view=self); return
-        if any(r["id"] == str(interaction.user.id) for r in roster):
+        if any(r["id"] == str(player.id) for r in roster):
             await interaction.edit_original_response(
                 content="❌ Already on this team.", view=self); return
-
-        try:
-            player = (guild.get_member(self.player_id)
-                      or await guild.fetch_member(self.player_id))
-        except discord.NotFound:
-            await interaction.edit_original_response(
-                content="❌ Couldn't find you in server.", view=self); return
 
         blox       = await bloxlink_lookup(player.id, guild.id)
         rbx_name   = blox.get("roblox_username", "Unknown")
@@ -735,9 +690,6 @@ class RankedPickupView(discord.ui.View):
                 allowed_mentions=discord.AllowedMentions(everyone=True),
             )
 
-        # Challenger's cooldown was already set when they sent the challenge.
-        # Set cooldown for the OPPONENT now that they've accepted — so they
-        # also can't immediately send a new challenge.
         p2["last_game"] = datetime.utcnow().isoformat()
         data.get("pending", {}).pop(self.match_id, None)
         await save_data(data)
@@ -850,7 +802,6 @@ class CasualPickupView(discord.ui.View):
 
         data = await load_data()
         data.get("casual_pending", {}).pop(self.match_id, None)
-        # Opponent gets their cooldown when they accept, same logic as ranked.
         opp_player = get_player(data, self.opponent_id)
         opp_player["last_game"] = datetime.utcnow().isoformat()
         await save_data(data)
@@ -968,7 +919,6 @@ async def _run_casual(interaction, opponent, game_link, your_team, opponent_team
                 f"❌ **{opponent.display_name}** already has a pending casual.",
                 ephemeral=True); return
 
-    # Cooldown starts when the casual challenge is sent, same as ranked.
     c_player = get_player(data, interaction.user.id)
     c_player["last_game"] = datetime.utcnow().isoformat()
 
@@ -1166,10 +1116,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction,
                                error: app_commands.AppCommandError):
-    """
-    Catch-all for slash command exceptions.  Without this, any unhandled
-    error propagates to the top level and can crash the Railway process.
-    """
     import traceback
     traceback.print_exc()
     msg = "❌ Something went wrong running that command. Try again in a moment."
@@ -1179,11 +1125,10 @@ async def on_app_command_error(interaction: discord.Interaction,
         else:
             await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
-        pass   # interaction already expired — nothing we can do
+        pass
 
 @bot.event
 async def on_error(event: str, *args, **kwargs):
-    """Log gateway / event errors without crashing the process."""
     import traceback
     print(f"[ERROR] Unhandled exception in event '{event}':")
     traceback.print_exc()
@@ -1312,12 +1257,10 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
     old_ids  = {r["id"] for r in team.get("roster", [])}
     old_data = {r["id"]: r for r in team.get("roster", [])}
 
-    # REPLACE roster entirely with whoever currently has the role
     new_roster = []
     for member in team_role.members:
         mid = str(member.id)
         if mid in old_data:
-            # Preserve existing roblox name and role label
             new_roster.append(old_data[mid])
         else:
             new_roster.append({"id": mid, "name": member.display_name,
@@ -1328,27 +1271,20 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
     added    = len(new_ids - old_ids)
     removed  = len(old_ids - new_ids)
 
-    # Clear HC if they no longer have the team role
-    hc_id = team.get("head_coach_id")
-    hc_cleared = False
+    hc_id = team.get("head_coach_id"); hc_cleared = False
     if hc_id:
         hc_m = interaction.guild.get_member(int(hc_id))
         if not hc_m or team_role not in hc_m.roles:
             team.update(head_coach_id=None, head_coach_name=None, head_coach_roblox="")
             hc_cleared = True
 
-    # Clear AHC if they no longer have the team role
-    ahc_id = team.get("ahc_id")
-    ahc_cleared = False
+    ahc_id = team.get("ahc_id"); ahc_cleared = False
     if ahc_id:
         ahc_m = interaction.guild.get_member(int(ahc_id))
         if not ahc_m or team_role not in ahc_m.roles:
             team.update(ahc_id=None, ahc_name=None, ahc_roblox="")
             ahc_cleared = True
 
-    # Auto-detect HC and AHC from Discord roles.
-    # Anyone who has the team role AND the HC/AHC league role is the coach
-    # of this team — even if they were never assigned through the bot.
     hc_role_obj  = interaction.guild.get_role(HEAD_COACH_ROLE_ID)
     ahc_role_obj = interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
     hc_detected = False; ahc_detected = False
@@ -1357,19 +1293,15 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
         if hc_role_obj and hc_role_obj in member.roles and not hc_detected:
             team["head_coach_id"]     = mid
             team["head_coach_name"]   = member.name
-            if not team.get("head_coach_roblox"):
-                team["head_coach_roblox"] = ""
-            hc_detected = True
-            hc_cleared  = False   # override the "cleared" flag — we found a new one
+            if not team.get("head_coach_roblox"): team["head_coach_roblox"] = ""
+            hc_detected = True; hc_cleared = False
             for r in team["roster"]:
                 if r["id"] == mid: r["role"] = "Head Coach"
         elif ahc_role_obj and ahc_role_obj in member.roles and not ahc_detected:
             team["ahc_id"]   = mid
             team["ahc_name"] = member.name
-            if not team.get("ahc_roblox"):
-                team["ahc_roblox"] = ""
-            ahc_detected = True
-            ahc_cleared  = False
+            if not team.get("ahc_roblox"): team["ahc_roblox"] = ""
+            ahc_detected = True; ahc_cleared = False
             for r in team["roster"]:
                 if r["id"] == mid: r["role"] = "Assistant Head Coach"
 
@@ -1383,7 +1315,7 @@ async def sync_roster(interaction: discord.Interaction, team_role: discord.Role)
     note_str = "\n" + "\n".join(notes) if notes else ""
 
     await interaction.followup.send(
-        f"✅ **{team['name']}** roster synced to current role members.\n"
+        f"✅ **{team['name']}** roster synced.\n"
         f"**{len(new_roster)}/{MAX_ROSTER}** members | +{added} added | -{removed} removed{note_str}",
         ephemeral=True,
     )
@@ -1407,8 +1339,6 @@ async def assign_hc(interaction: discord.Interaction,
     blox = await bloxlink_lookup(player.id, interaction.guild.id)
     rbx  = blox.get("roblox_username", "")
 
-    # Clear this player's HC slot on any OTHER team first so they don't
-    # appear as HC of two teams at once.
     for other_rid, other_team in data["teams"].items():
         if other_rid != rid and other_team.get("head_coach_id") == str(player.id):
             other_team["head_coach_id"]     = None
@@ -1519,30 +1449,25 @@ async def release(interaction: discord.Interaction, player: discord.Member):
             "❌ You're not HC or AHC of any team.", ephemeral=True); return
 
     if not team and is_staff(interaction):
-        # Staff: find the player's team by role first, then DB
         rid, team = get_player_team(data, player.id, player)
         if not team:
             await interaction.followup.send(
                 f"❌ {player.display_name} isn't on any registered team.",
                 ephemeral=True); return
 
-    # Confirm the player is actually on this team — role OR DB entry
     team_role_obj = get_role(interaction.guild, rid)
-    in_db   = any(r["id"] == str(player.id) for r in team.get("roster", []))
+    in_db    = any(r["id"] == str(player.id) for r in team.get("roster", []))
     has_role = team_role_obj is not None and team_role_obj in player.roles
 
     if not in_db and not has_role:
         await interaction.followup.send(
-            f"❌ {player.display_name} isn't on **{team['name']}** "
-            f"(not in the roster and doesn't have the team role).",
+            f"❌ {player.display_name} isn't on **{team['name']}**.",
             ephemeral=True); return
 
-    # Remove from ALL team rosters in DB (cleans up any stale entries too)
     for t in data["teams"].values():
         t["roster"] = [r for r in t.get("roster", []) if r["id"] != str(player.id)]
     await save_data(data)
 
-    # Remove the team role
     rf = False
     if team_role_obj and team_role_obj in player.roles:
         try:   await player.remove_roles(team_role_obj, reason=f"Released from {team['name']}")
@@ -1561,8 +1486,6 @@ async def demand(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     data = await load_data(); uid = str(interaction.user.id)
 
-    # Role-first lookup — handles players who were manually role-assigned
-    # outside the bot and whose DB entry may point to the wrong team.
     found_rid, found_team = get_player_team(data, uid, interaction.user)
     if not found_team:
         await interaction.followup.send(
@@ -1582,7 +1505,6 @@ async def demand(interaction: discord.Interaction):
     else:
         data.setdefault("demand_used", {})[uid] = True
 
-    # Remove player from ALL team rosters so stale DB entries don't linger
     for t in data["teams"].values():
         t["roster"] = [r for r in t.get("roster", []) if r["id"] != uid]
     await save_data(data)
@@ -1611,8 +1533,8 @@ async def demand(interaction: discord.Interaction):
         color=0xED4245,
     )
     embed.set_footer(text=UFF_FOOTER); embed.timestamp = datetime.utcnow()
-    if rbx_avatar:                   embed.set_thumbnail(url=rbx_avatar)
-    elif found_team.get("logo_url"): embed.set_thumbnail(url=found_team["logo_url"])
+    if rbx_avatar:                    embed.set_thumbnail(url=rbx_avatar)
+    elif found_team.get("logo_url"):  embed.set_thumbnail(url=found_team["logo_url"])
 
     msg = f"✅ Your demand from **{found_team['name']}** has been posted."
     if rf: msg += _role_warn(found_team["name"])
@@ -1834,8 +1756,6 @@ COACHES_CHANNEL_ID = 1274811643338948618
 @bot.tree.command(name="coaches",
                   description="View all head coaches across the league")
 async def coaches_cmd(interaction: discord.Interaction):
-    # Public in the coaches channel so everyone can see open slots;
-    # ephemeral everywhere else.
     public = interaction.channel_id == COACHES_CHANNEL_ID
     await interaction.response.defer(ephemeral=not public)
 
@@ -1894,12 +1814,9 @@ async def coaches_cmd(interaction: discord.Interaction):
 )
 async def stream_post(
     interaction: discord.Interaction,
-    season: str,
-    series: str,
-    team1: discord.Role,
-    team1_record: str,
-    team2: discord.Role,
-    team2_record: str,
+    season: str, series: str,
+    team1: discord.Role, team1_record: str,
+    team2: discord.Role, team2_record: str,
     stream_url: str,
 ):
     await interaction.response.defer(ephemeral=True)
@@ -1909,10 +1826,8 @@ async def stream_post(
     ch = await get_stream_ch(interaction.guild)
     if not ch:
         await interaction.followup.send(
-            "❌ Stream channel not found. Check STREAM_CHANNEL_ID.", ephemeral=True)
-        return
+            "❌ Stream channel not found.", ephemeral=True); return
 
-    # Plain text — Discord auto-embeds the stream URL preview.
     content = (
         f"@here\n"
         f"**Season {season} - Series {series}**\n"
@@ -1952,14 +1867,11 @@ async def pickup_ranked(interaction: discord.Interaction, opponent: discord.Memb
             "❌ Can't challenge a bot!", ephemeral=True); return
 
     data = await load_data()
-
-    # Clean up stale entries first so expired challenges don't block forever
     _expire_pending(data)
 
     uid = str(interaction.user.id)
     oid = str(opponent.id)
 
-    # Block if either player already has an active (non-expired) pending challenge
     for m in data.get("pending", {}).values():
         if m["challenger_id"] == uid or m["opponent_id"] == uid:
             await interaction.followup.send(
@@ -1971,7 +1883,6 @@ async def pickup_ranked(interaction: discord.Interaction, opponent: discord.Memb
                 f"❌ **{opponent.display_name}** already has a pending challenge.",
                 ephemeral=True); return
 
-    # Cooldown — starts from when a challenge is accepted/posted to channel
     cd, remaining = on_cooldown(data, interaction.user.id)
     if cd:
         e = discord.Embed(
@@ -1986,11 +1897,6 @@ async def pickup_ranked(interaction: discord.Interaction, opponent: discord.Memb
 
     p1 = get_player(data, interaction.user.id); p1["username"] = interaction.user.display_name
     p2 = get_player(data, opponent.id);         p2["username"] = opponent.display_name
-
-    # Cooldown starts NOW for the challenger — the moment they send the
-    # challenge.  This is what prevents channel spam.  It is NOT reset when
-    # results are submitted, so once it expires the challenger can post again
-    # regardless of whether the previous game's results were filed.
     p1["last_game"] = datetime.utcnow().isoformat()
 
     mid = f"{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
@@ -2104,10 +2010,6 @@ async def pickup_results(interaction: discord.Interaction, winner: discord.Membe
     lp["elo"]      = max(0, lp["elo"] - LOSS_ELO)
     wp["wins"]    += 1; lp["losses"] += 1
     now = datetime.utcnow().isoformat()
-    # NOTE: last_game is intentionally NOT updated here.  The cooldown timer
-    # starts when the challenge is sent (challenger) or accepted (opponent)
-    # and submitting results must not reset it — once it expires the players
-    # can post again whether or not results were ever filed.
 
     data.setdefault("matches", []).append({
         "winner_id":       str(winner.id),   "winner_name":  winner.display_name,
@@ -2381,7 +2283,6 @@ async def help_uff(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="🧵 Scheduling Threads", value=(
         "`/thread_create` — [Staff] Create a private scheduling thread for two teams\n"
-        "Adds HCs, AHCs, and all staff from the DB automatically\n"
         "`/thread_delete` — [Staff/HC/AHC] Delete the thread when done"
     ), inline=False)
     embed.add_field(name="⚔️ Ranked Pickup", value=(
@@ -2411,7 +2312,6 @@ async def help_uff(interaction: discord.Interaction):
     embed.set_footer(text=f"{UFF_FOOTER} • {COOLDOWN_MINUTES}-min ranked cooldown")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 # ══════════════════════════════════════════════════════════════════════
 # SCHEDULING THREAD COMMANDS
 # ══════════════════════════════════════════════════════════════════════
@@ -2435,12 +2335,10 @@ async def thread_create(interaction: discord.Interaction,
         await interaction.followup.send(
             f"❌ {team2.mention} not registered.", ephemeral=True); return
 
-    # Thread name — emoji + team name for each side
     e1   = (t1.get("emoji","") + " ") if t1.get("emoji") else ""
     e2   = (t2.get("emoji","") + " ") if t2.get("emoji") else ""
     name = f"{e1}{t1['name']} vs {e2}{t2['name']}"[:100]
 
-    # Create private thread in the channel the command was used in
     try:
         thread = await interaction.channel.create_thread(
             name=name,
@@ -2449,20 +2347,15 @@ async def thread_create(interaction: discord.Interaction,
         )
     except discord.Forbidden:
         await interaction.followup.send(
-            "❌ Missing **Create Private Threads** permission in this channel.",
+            "❌ Missing **Create Private Threads** permission.",
             ephemeral=True); return
     except Exception as e:
         await interaction.followup.send(f"❌ Could not create thread: {e}",
                                         ephemeral=True); return
 
-    # ── Collect members to add ─────────────────────────────────────
-    to_add = set()  # set of discord.Member
-
-    # HCs and AHCs from the DB for both teams
-    coach_ids = [
-        t1.get("head_coach_id"), t1.get("ahc_id"),
-        t2.get("head_coach_id"), t2.get("ahc_id"),
-    ]
+    to_add = set()
+    coach_ids = [t1.get("head_coach_id"), t1.get("ahc_id"),
+                 t2.get("head_coach_id"), t2.get("ahc_id")]
     for uid in coach_ids:
         if not uid: continue
         try:
@@ -2472,20 +2365,15 @@ async def thread_create(interaction: discord.Interaction,
         except Exception:
             pass
 
-    # Everyone with a staff role
     for rid in STAFF_ROLE_IDS:
         role = interaction.guild.get_role(rid)
-        if role:
-            to_add.update(role.members)
+        if role: to_add.update(role.members)
 
-    # Always include the person who ran the command
     to_add.add(interaction.user)
-
     for member in to_add:
         try:   await thread.add_user(member)
         except Exception: pass
 
-    # ── Ping embed inside the thread ───────────────────────────────
     hc1_id  = t1.get("head_coach_id")
     ahc1_id = t1.get("ahc_id")
     hc2_id  = t2.get("head_coach_id")
@@ -2510,9 +2398,7 @@ async def thread_create(interaction: discord.Interaction,
     embed.set_footer(text=UFF_FOOTER)
     embed.timestamp = datetime.utcnow()
 
-    # Ping everyone relevant (users only — role pings in private threads
-    # only notify people already in the thread, which is fine here)
-    ping_parts = [f"<@{uid}>" for uid in [hc1_id, ahc1_id, hc2_id, ahc2_id] if uid]
+    ping_parts   = [f"<@{uid}>" for uid in [hc1_id, ahc1_id, hc2_id, ahc2_id] if uid]
     ping_content = " ".join(ping_parts) if ping_parts else ""
 
     await thread.send(
@@ -2528,7 +2414,6 @@ async def thread_create(interaction: discord.Interaction,
 @bot.tree.command(name="thread_delete",
                   description="[Staff/HC/AHC] Delete this scheduling thread when done")
 async def thread_delete(interaction: discord.Interaction):
-    # Check channel type BEFORE deferring so we can reply normally
     if not isinstance(interaction.channel, discord.Thread):
         await interaction.response.send_message(
             "❌ This command must be used **inside** a thread.", ephemeral=True)
@@ -2547,9 +2432,6 @@ async def thread_delete(interaction: discord.Interaction):
             ephemeral=True); return
 
     thread = interaction.channel
-
-    # Send the ack BEFORE deleting — once the thread is gone the followup
-    # webhook call would fail because the channel no longer exists.
     try:
         await interaction.followup.send(
             f"🗑️ Deleting **{thread.name}**…", ephemeral=True)
@@ -2559,7 +2441,6 @@ async def thread_delete(interaction: discord.Interaction):
     try:
         await thread.delete()
     except discord.Forbidden:
-        # Can't send followup to deleted/inaccessible thread; just log it.
         print(f"[thread_delete] Missing permission to delete thread {thread.id}")
     except Exception as e:
         print(f"[thread_delete] Error deleting thread {thread.id}: {e}")
