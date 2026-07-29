@@ -66,27 +66,24 @@ STAFF_ROLE_IDS = {
 SUSPENSION_CHANNEL_ID       = 1364423515532427264
 SUSPENSION_ALLOWED_USER_IDS = {1414340980110528546, 1055321446978691112}
 SUSPENSION_ALLOWED_ROLE_IDS = {1513234210054344925, 1499141732108079225}
-MAX_SUSPENSION_REASONS      = 5
+MAX_SUSPENSION_REASONS      = 9
 
 SUSPENSION_REASONS = {
     "exploiting_x1":             ("Exploiting",                24),
-    "dodging_screenshare_x1":    ("Dodging Screenshare",        6),
-    "illegally_playing_x1":      ("Illegally Playing",          2),
-    "illegally_playing_x2":      ("Illegally Playing",          2),
-    "illegally_playing_x3":      ("Illegally Playing",          2),
-    "illegally_playing_x4":      ("Illegally Playing",          2),
+    "dodging_screenshare":       ("Dodging Screenshare",        6),
+    "Leaking":                   ("Leaking",          8),
     "possession_of_exploits_x1": ("Possession of Exploits",    12),
     "possession_of_exploits_x2": ("Possession of Exploits",    12),
     "possession_of_exploits_x3": ("Possession of Exploits",    12),
     "possession_of_exploits_x4": ("Possession of Exploits",    12),
-    "gameplay_manipulation_x1":  ("Gameplay Manipulation",      8),
+    "gameplay_manipulation":     ("Gameplay Manipulation",      8),
     "alting_x1":                 ("Alting",                    12),
     "alting_x2":                 ("Alting",                    12),
     "alting_x3":                 ("Alting",                    12),
     "alting_x4":                 ("Alting",                    12),
-    "disbanding_x1":             ("Disbanding",                 4),
-    "distributing_exploits_x1":  ("Distributing Exploits",     40),
-    "distributing_alts_x1":      ("Distributing Alt Accounts", 25),
+    "disbanding":                ("Disbanding",                 4),
+    "distributing_exploits_x1":  ("Distributing Exploits",     60),
+    "distributing_alts_x1":      ("Distributing Alt Accounts", 35),
     "framing_x1":                ("Framing",                   12),
     "obstruction_of_justice_x1": ("Obstruction of Justice",     8),
 }
