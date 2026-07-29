@@ -1829,10 +1829,16 @@ async def roster_cmd(interaction: discord.Interaction, team_role: discord.Role):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+COACHES_CHANNEL_ID = 1274811643338948618
+
 @bot.tree.command(name="coaches",
                   description="View all head coaches across the league")
 async def coaches_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    # Public in the coaches channel so everyone can see open slots;
+    # ephemeral everywhere else.
+    public = interaction.channel_id == COACHES_CHANNEL_ID
+    await interaction.response.defer(ephemeral=not public)
+
     data  = await load_data(); teams = data.get("teams", {})
     embed = discord.Embed(title="head coaches", color=UFF_COLOR)
 
@@ -1869,7 +1875,7 @@ async def coaches_cmd(interaction: discord.Interaction):
     thumb = ZEVORA_LOGO_URL or UFF_THUMBNAIL or _league_thumb(interaction.guild)
     if thumb: embed.set_thumbnail(url=thumb)
     embed.set_footer(text=UFF_FOOTER); embed.timestamp = datetime.utcnow()
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=not public)
 
 # ══════════════════════════════════════════════════════════════════════
 # STREAM POST
