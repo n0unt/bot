@@ -1661,7 +1661,7 @@ async def thread_create(interaction:discord.Interaction,team1:discord.Role,team2
     except discord.Forbidden:
         await interaction.followup.send("❌ Missing Create Private Threads permission.",ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ Could not create thread: {e}",ephemeral=True)
+        await interaction.followup.send(f"❌ Could not create threadd: {e}",ephemeral=True)
 
 
 @bot.tree.command(name="schedule",
