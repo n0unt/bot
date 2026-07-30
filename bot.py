@@ -1,43 +1,32 @@
 """
 UFF Discord Bot — United Flag Football League
-v6 changelog:
-
-  - FIX (thread name): Custom server emoji in team emoji field showed as raw
-    <:name:id> text in thread names. Now stripped before setting the name.
-  - NEW: /schedule command — paste the full week's schedule (supports both
-    raw Discord <@&ID> mentions from copying the message source, and plain
-    @Team Name text from copying visually). Auto-creates a private scheduling
-    thread for every "Team A vs Team B" line found.
-  - NEW: Transaction embed look — format is now:
-      {emoji} {Full Team Name} <:verified:ID> @{LastWord} have **action** …
-    e.g. "🔴 Seminola Spartans ✅ @Spartans have released …"
-    Looks up the :verified: custom emoji from the server; falls back to ✅.
-  - All v5.1 behaviour preserved.
+v6.1 changelog:
+  - REDESIGN (transaction embeds): New NFL-style embed format:
+      • Embed TITLE  : "Team Name :verified: @LastWord"
+      • Embed BODY   : "are signing/releasing/etc @player rbxname"
+      • Roster block in description
+      • Team logo as thumbnail, team color as embed color
+  - FIX (schedule command): Now correctly parses ALL lines including
+    primetime / GOTW headers. Strips bold markers (**), seeding numbers
+    (#4), and inline annotations before splitting on "vs".
 """
 
-import re
-import discord
+import re, asyncio, discord, json, os, aiohttp, asyncpg
 from discord import app_commands
 from discord.ext import commands
-import json
-import os
-import aiohttp
-import asyncio
 from datetime import datetime, timedelta
-import asyncpg
 
-TOKEN            = os.getenv("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID         = int(os.getenv("OWNER_DISCORD_ID", "0"))
-QBB_CHANNEL_ID   = int(os.getenv("QBB_CHANNEL_ID", "0"))
-BLOXLINK_API_KEY = os.getenv("BLOXLINK_API_KEY", "")
-DATABASE_URL     = os.getenv("DATABASE_URL", "")
-UFF_THUMBNAIL    = os.getenv("UFF_THUMBNAIL_URL", "")
-UFF_BANNER       = os.getenv("UFF_BANNER_URL", "")
-ZEVORA_LOGO_URL  = os.getenv("ZEVORA_LOGO_URL", "")
+TOKEN            = os.getenv("DISCORD_BOT_TOKEN","")
+OWNER_ID         = int(os.getenv("OWNER_DISCORD_ID","0"))
+QBB_CHANNEL_ID   = int(os.getenv("QBB_CHANNEL_ID","0"))
+BLOXLINK_API_KEY = os.getenv("BLOXLINK_API_KEY","")
+DATABASE_URL     = os.getenv("DATABASE_URL","")
+UFF_THUMBNAIL    = os.getenv("UFF_THUMBNAIL_URL","")
+UFF_BANNER       = os.getenv("UFF_BANNER_URL","")
+ZEVORA_LOGO_URL  = os.getenv("ZEVORA_LOGO_URL","")
 
 TRANSACTIONS_CHANNEL_ID = 1262200420151984152
 STREAM_CHANNEL_ID       = 1402467692660789259
-STREAM_PING_ROLE_ID     = 1414053505311834242
 COACHES_CHANNEL_ID      = 1274811643338948618
 
 UFF_FOOTER   = "United Flag Football League"
@@ -56,17 +45,17 @@ ASSISTANT_COACH_ROLE_ID = 1267278742389264406
 SUSPENSION_ROLE_ID      = 1262200419564785759
 
 PICKUP_ALLOWED_ROLE_IDS = {
-    1269693904815521994, 1404271074623099040, 1404271002241728617,
-    1429344923865448550, 1262200419686285342, 1401450124424642561,
+    1269693904815521994,1404271074623099040,1404271002241728617,
+    1429344923865448550,1262200419686285342,1401450124424642561,
 }
 STAFF_ROLE_IDS = {
-    1404271002241728617, 1429344923865448550, 1262200419686285342,
-    1401450124424642561, 1499141732108079225, 1434653599236882574,
+    1404271002241728617,1429344923865448550,1262200419686285342,
+    1401450124424642561,1499141732108079225,1434653599236882574,
     1502941495722770472,
 }
 SUSPENSION_CHANNEL_ID       = 1364423515532427264
-SUSPENSION_ALLOWED_USER_IDS = {1414340980110528546, 1055321446978691112}
-SUSPENSION_ALLOWED_ROLE_IDS = {1513234210054344925, 1499141732108079225}
+SUSPENSION_ALLOWED_USER_IDS = {1414340980110528546,1055321446978691112}
+SUSPENSION_ALLOWED_ROLE_IDS = {1513234210054344925,1499141732108079225}
 MAX_SUSPENSION_REASONS      = 9
 
 SUSPENSION_REASONS = {
@@ -88,8 +77,8 @@ SUSPENSION_REASONS = {
     "framing_x1":                ("Framing",                   12),
     "obstruction_of_justice_x1": ("Obstruction of Justice",     8),
 }
-SPECIAL_SUSPENSION_REASONS  = {"ineligible_until_ss": "Ineligible Until Screenshare"}
-EXTRA_DEMAND_GRANT_USER_IDS = {1055321446978691112, 391036854084042762}
+SPECIAL_SUSPENSION_REASONS  = {"ineligible_until_ss":"Ineligible Until Screenshare"}
+EXTRA_DEMAND_GRANT_USER_IDS = {1055321446978691112,391036854084042762}
 
 TEAMS = [
     ("Shiroishi Samurai","SHI",0x4d4d4e),("Vicksburg Vortex","VIC",0x230552),
@@ -109,8 +98,8 @@ _db_pool = None
 
 async def get_db():
     global _db_pool
-    if _db_pool is None or getattr(_db_pool, "_closed", False):
-        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    if _db_pool is None or getattr(_db_pool,"_closed",False):
+        _db_pool = await asyncpg.create_pool(DATABASE_URL,min_size=1,max_size=5)
     return _db_pool
 
 async def init_db():
@@ -132,42 +121,35 @@ async def load_data():
             pool = await get_db()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT key, value FROM uff_store WHERE key = ANY($1::text[])",
-                    _STORE_KEYS,
-                )
-            found = {r["key"]: json.loads(r["value"]) for r in rows}
-            data  = {}
-            for k in _STORE_KEYS:
-                data[k] = found.get(k, [] if k in ("matches","suspensions") else {})
-            return data
+                    "SELECT key,value FROM uff_store WHERE key=ANY($1::text[])",_STORE_KEYS)
+            found = {r["key"]:json.loads(r["value"]) for r in rows}
+            return {k:found.get(k,[] if k in ("matches","suspensions") else {}) for k in _STORE_KEYS}
         except Exception as e:
             print(f"[DB] load_data error (attempt {attempt+1}): {e}")
             _db_pool = None
-            if attempt == 1: raise
+            if attempt==1: raise
 
 async def save_data(data):
     global _db_pool
     for attempt in range(2):
         try:
             pool = await get_db()
-            rows = [(k, json.dumps(v, default=str)) for k, v in data.items()]
+            rows = [(k,json.dumps(v,default=str)) for k,v in data.items()]
             async with pool.acquire() as conn:
                 await conn.executemany(
                     "INSERT INTO uff_store(key,value) VALUES($1,$2) "
-                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                    rows,
-                )
+                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",rows)
             return
         except Exception as e:
             print(f"[DB] save_data error (attempt {attempt+1}): {e}")
             _db_pool = None
-            if attempt == 1: raise
+            if attempt==1: raise
 
-# ── HELPERS ───────────────────────────────────────────────────────────
-def get_player(data, uid):
-    k = str(uid)
+# ── CORE HELPERS ──────────────────────────────────────────────────────
+def get_player(data,uid):
+    k=str(uid)
     if k not in data["players"]:
-        data["players"][k] = {"elo":STARTING_ELO,"wins":0,"losses":0,"last_game":None,"username":""}
+        data["players"][k]={"elo":STARTING_ELO,"wins":0,"losses":0,"last_game":None,"username":""}
     return data["players"][k]
 
 def get_rank(elo):
@@ -181,187 +163,137 @@ def get_rank(elo):
     if elo>=700:  return "Iron II",     "⚙️",0x8090A0
     return "Iron I","⚙️",0x8090A0
 
-def on_cooldown(data, uid):
-    p = get_player(data, uid)
-    if not p["last_game"]: return False, None
-    diff = (datetime.fromisoformat(p["last_game"])
-            + timedelta(minutes=COOLDOWN_MINUTES)
-            - datetime.utcnow())
-    if diff.total_seconds() > 0:
-        m = int(diff.total_seconds()//60); s = int(diff.total_seconds()%60)
-        return True, f"{m}m {s}s"
-    return False, None
+def on_cooldown(data,uid):
+    p=get_player(data,uid)
+    if not p["last_game"]: return False,None
+    diff=(datetime.fromisoformat(p["last_game"])+timedelta(minutes=COOLDOWN_MINUTES)-datetime.utcnow())
+    if diff.total_seconds()>0:
+        return True,f"{int(diff.total_seconds()//60)}m {int(diff.total_seconds()%60)}s"
+    return False,None
 
 def is_admin(i): return i.user.id==OWNER_ID or i.user.guild_permissions.administrator
 def is_staff(i):
     if is_admin(i): return True
-    return bool({r.id for r in i.user.roles} & STAFF_ROLE_IDS)
+    return bool({r.id for r in i.user.roles}&STAFF_ROLE_IDS)
 def can_issue_suspension(i):
     if i.user.id in SUSPENSION_ALLOWED_USER_IDS: return True
-    return bool({r.id for r in i.user.roles} & SUSPENSION_ALLOWED_ROLE_IDS) or is_admin(i)
+    return bool({r.id for r in i.user.roles}&SUSPENSION_ALLOWED_ROLE_IDS) or is_admin(i)
 
 def _league_thumb(guild):
     return (ZEVORA_LOGO_URL or UFF_THUMBNAIL
             or (str(guild.icon.url) if guild and guild.icon else ""))
 
 def _role_warn(label):
-    return (f"\n⚠️ Could not update **{label}** role — "
-            f"check bot role position and Manage Roles permission.")
+    return f"\n⚠️ Could not update **{label}** role — check bot role position and Manage Roles permission."
 
-async def get_ch(guild, ch_id):
+async def get_ch(guild,ch_id):
     if not ch_id: return None
-    ch = guild.get_channel(ch_id)
+    ch=guild.get_channel(ch_id)
     if ch: return ch
     try:    return await guild.fetch_channel(ch_id)
     except: return None
 
-async def get_pickup_ch(guild): return await get_ch(guild, QBB_CHANNEL_ID)
-async def get_susp_ch(guild):   return await get_ch(guild, SUSPENSION_CHANNEL_ID)
-async def get_tx_ch(guild):     return await get_ch(guild, TRANSACTIONS_CHANNEL_ID)
-async def get_stream_ch(guild): return await get_ch(guild, STREAM_CHANNEL_ID)
+async def get_pickup_ch(guild): return await get_ch(guild,QBB_CHANNEL_ID)
+async def get_susp_ch(guild):   return await get_ch(guild,SUSPENSION_CHANNEL_ID)
+async def get_tx_ch(guild):     return await get_ch(guild,TRANSACTIONS_CHANNEL_ID)
+async def get_stream_ch(guild): return await get_ch(guild,STREAM_CHANNEL_ID)
 
 def _expire_pending(data):
-    cutoff = datetime.utcnow() - timedelta(minutes=COOLDOWN_MINUTES)
-    stale  = [k for k,m in data.get("pending",{}).items() if _ts(m.get("timestamp"))<cutoff]
-    for k in stale: data["pending"].pop(k,None)
+    cutoff=datetime.utcnow()-timedelta(minutes=COOLDOWN_MINUTES)
+    for k in [k for k,m in data.get("pending",{}).items() if _ts(m.get("timestamp"))<cutoff]:
+        data["pending"].pop(k,None)
 
-def _expire_casual_pending(data):
-    cutoff = datetime.utcnow() - timedelta(minutes=COOLDOWN_MINUTES)
-    stale  = [k for k,m in data.get("casual_pending",{}).items() if _ts(m.get("timestamp"))<cutoff]
-    for k in stale: data["casual_pending"].pop(k,None)
+def _expire_casual(data):
+    cutoff=datetime.utcnow()-timedelta(minutes=COOLDOWN_MINUTES)
+    for k in [k for k,m in data.get("casual_pending",{}).items() if _ts(m.get("timestamp"))<cutoff]:
+        data["casual_pending"].pop(k,None)
 
 def _ts(iso):
     try:    return datetime.fromisoformat(iso)
     except: return datetime.min
 
-# ── NEW HELPERS ───────────────────────────────────────────────────────
+# ── NAME / EMOJI HELPERS ──────────────────────────────────────────────
 def get_verified_emoji(guild) -> str:
-    """
-    Look up the :verified: custom emoji from the server.
-    Falls back to the ✅ Unicode emoji if not found.
-    """
     if guild:
-        for emoji in guild.emojis:
-            if emoji.name.lower() == "verified":
-                return str(emoji)
+        for e in guild.emojis:
+            if e.name.lower()=="verified":
+                return str(e)
     return "✅"
 
-def _clean_thread_name(text: str) -> str:
-    """
-    Strip custom Discord emoji tags (<:name:id> / <a:name:id>) from text
-    so they don't appear as raw strings in thread names.
-    Unicode emoji (🏈 etc.) are left intact.
-    """
-    cleaned = re.sub(r"<a?:[^:>]+:\d+>", "", text)
-    return " ".join(cleaned.split())[:100]   # collapse extra spaces, cap length
+def _last_word(name:str) -> str:
+    words=name.strip().split()
+    return words[-1] if words else name
 
-def _team_last_word(team_name: str) -> str:
-    """Return the last word of a team name — the mascot part."""
-    words = team_name.strip().split()
-    return words[-1] if words else team_name
-
-def _find_role_in_text(text: str, guild: discord.Guild):
-    """
-    Try to find a Discord Role mentioned in a text segment.
-    Handles both raw <@&ID> copies and plain @Team Name text.
-    """
-    # Raw mention format
-    m = re.search(r"<@&(\d+)>", text)
-    if m:
-        role = guild.get_role(int(m.group(1)))
-        if role: return role
-
-    # Plain @Team Name — extract everything after the @
-    at = re.search(r"@(.+?)(?:\s*#\d+\s*$|\s*$)", text.strip())
-    if at:
-        candidate = at.group(1).strip()
-        # Exact match
-        for role in guild.roles:
-            if role.name.lower() == candidate.lower():
-                return role
-        # Role name ends with candidate (e.g. "@Spartans" → "Seminola Spartans")
-        for role in guild.roles:
-            if role.name.lower().endswith(candidate.lower()):
-                return role
-        # Candidate contained in role name
-        for role in guild.roles:
-            if candidate.lower() in role.name.lower():
-                return role
-    return None
+def _clean_thread_name(text:str) -> str:
+    cleaned=re.sub(r"<a?:[^:>]+:\d+>","",text)
+    return " ".join(cleaned.split())[:100]
 
 # ── BLOXLINK ──────────────────────────────────────────────────────────
-async def bloxlink_lookup(discord_id, guild_id):
-    if not BLOXLINK_API_KEY:
-        return {"error": "BLOXLINK_API_KEY not set"}
+async def bloxlink_lookup(discord_id,guild_id):
+    if not BLOXLINK_API_KEY: return {"error":"BLOXLINK_API_KEY not set"}
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(
-                f"https://api.blox.link/v4/public/guilds/{guild_id}"
-                f"/discord-to-roblox/{discord_id}",
-                headers={"Authorization": BLOXLINK_API_KEY},
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                if r.status != 200: return {"error": f"Bloxlink HTTP {r.status}"}
-                body = await r.json()
-        rid = body.get("robloxID")
-        if not rid: return {"error": "No Roblox account linked"}
-
+                f"https://api.blox.link/v4/public/guilds/{guild_id}/discord-to-roblox/{discord_id}",
+                headers={"Authorization":BLOXLINK_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status!=200: return {"error":f"Bloxlink HTTP {r.status}"}
+                body=await r.json()
+        rid=body.get("robloxID")
+        if not rid: return {"error":"No Roblox account linked"}
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://users.roblox.com/v1/users/{rid}",
                              timeout=aiohttp.ClientTimeout(total=8)) as r:
-                udata = await r.json() if r.status==200 else {}
-        username = udata.get("name", str(rid))
-
-        avatar_url = ""
+                udata=await r.json() if r.status==200 else {}
+        username=udata.get("name",str(rid))
+        avatar_url=""
         async with aiohttp.ClientSession() as s:
             async with s.get(
                 f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
                 f"?userIds={rid}&size=150x150&format=Png&isCircular=false",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
+                timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status==200:
-                    td=await r.json(); items=td.get("data",[])
-                    avatar_url = items[0].get("imageUrl","") if items else ""
-
+                    items=(await r.json()).get("data",[])
+                    avatar_url=items[0].get("imageUrl","") if items else ""
         return {"roblox_username":username,"roblox_id":int(rid),"avatar_url":avatar_url}
     except Exception as e:
         return {"error":str(e)}
 
 # ── TEAM HELPERS ──────────────────────────────────────────────────────
-def get_team_by_role(data, role_id):
+def get_team_by_role(data,role_id):
     return data["teams"].get(str(role_id))
 
-def get_team_for_hc(data, uid):
-    s = str(uid)
+def get_team_for_hc(data,uid):
+    s=str(uid)
     for rid,t in data["teams"].items():
         if t.get("head_coach_id")==s: return rid,t
     return None,None
 
-def get_team_for_user(data, uid, member=None):
-    s = str(uid)
+def get_team_for_user(data,uid,member=None):
+    s=str(uid)
     for rid,t in data["teams"].items():
         if t.get("head_coach_id")==s: return rid,t
     for rid,t in data["teams"].items():
         if t.get("ahc_id")==s: return rid,t
     if member is not None:
-        coach_role_ids = {HEAD_COACH_ROLE_ID, ASSISTANT_COACH_ROLE_ID}
-        if any(r.id in coach_role_ids for r in member.roles):
-            role_ids = {str(r.id) for r in member.roles}
+        coach_ids={HEAD_COACH_ROLE_ID,ASSISTANT_COACH_ROLE_ID}
+        if any(r.id in coach_ids for r in member.roles):
+            role_ids={str(r.id) for r in member.roles}
             for rid,team in data["teams"].items():
                 if rid in role_ids: return rid,team
     return None,None
 
-def get_player_team(data, uid, member=None):
+def get_player_team(data,uid,member=None):
     if member is not None:
-        role_ids = {str(r.id) for r in member.roles}
+        role_ids={str(r.id) for r in member.roles}
         for rid,team in data["teams"].items():
             if rid in role_ids: return rid,team
-    s = str(uid)
+    s=str(uid)
     for rid,t in data["teams"].items():
         if any(r["id"]==s for r in t.get("roster",[])): return rid,t
     return None,None
 
-def get_role(guild, rid_str):
+def get_role(guild,rid_str):
     try:    return guild.get_role(int(rid_str))
     except: return None
 
@@ -377,114 +309,168 @@ def _susp_summary(selected):
     lines=[]
     for lb,gl in lg.items():
         c=len(gl); p=gl[0]; sub=p*c
-        lines.append(f"• **{lb}** — {p}g ×{c} = **{sub} games**" if c>1
-                     else f"• **{lb}** — {p} games")
+        lines.append(f"• **{lb}** — {p}g ×{c} = **{sub} games**" if c>1 else f"• **{lb}** — {p} games")
     rl="\n".join(lines)
     sl=("**Status:** "+", ".join(f"`{SPECIAL_SUSPENSION_REASONS[r]}`" for r in sk)) if sk else ""
     return total,rl,sl
 
 # ── EMBED BUILDERS ────────────────────────────────────────────────────
 def _info_block(team):
+    """Roster/coach summary lines used inside transaction embeds."""
     sz=len(team.get("roster",[]))
     hc_id=team.get("head_coach_id"); hc_name=team.get("head_coach_name",""); hc_rbx=team.get("head_coach_roblox","")
     ahc_id=team.get("ahc_id"); ahc_name=team.get("ahc_name",""); ahc_rbx=team.get("ahc_roblox","")
-    lines=[f"> roster: {sz}/{MAX_ROSTER}"]
+    lines=[f"roster: {sz}/{MAX_ROSTER}"]
     if hc_id:
         rbx=f" {hc_rbx}" if hc_rbx else ""
-        lines.append(f"> head coach: <@{hc_id}> (@{hc_name}) ✓{rbx}")
+        lines.append(f"head coach: <@{hc_id}> (@{hc_name}) ✓{rbx}")
     else:
-        lines.append("> head coach: vacant")
+        lines.append("head coach: vacant")
     if ahc_id:
         rbx=f" {ahc_rbx}" if ahc_rbx else ""
-        lines.append(f"> assistant coach: <@{ahc_id}> (@{ahc_name}) ✓{rbx}")
+        lines.append(f"assistant coach: <@{ahc_id}> (@{ahc_name}) ✓{rbx}")
     else:
-        lines.append("> assistant coach: vacant")
+        lines.append("assistant coach: vacant")
     return "\n".join(lines)
 
-def _tx_desc(prefix, team_name, action, player, rbx_name, team, verified="✅"):
-    """
-    New format:
-      {emoji} {Full Team Name} :verified: @{LastWord} have **action** @player ...
-    e.g. "🔴 Seminola Spartans ✅ @Spartans have released @fearing ..."
-    """
-    rbx       = f" {rbx_name}" if rbx_name and rbx_name != "Unknown" else ""
-    last_word = _team_last_word(team_name)
-    return (
-        f"{prefix}{team_name} {verified} @{last_word} have **{action.lower()}** "
-        f"{player.mention} (@{player.name}){rbx}!\n\n"
-        f"{_info_block(team)}"
-    )
-
-def _coach_desc(prefix, team_name, action, player, rbx_name, role_lbl, team, verified="✅"):
-    rbx       = f" {rbx_name}" if rbx_name and rbx_name != "Unknown" else ""
-    last_word = _team_last_word(team_name)
-    return (
-        f"{prefix}{team_name} {verified} @{last_word} have **{action.lower()}** "
-        f"{player.mention} (@{player.name}){rbx} to {role_lbl}!\n\n"
-        f"{_info_block(team)}"
-    )
-
-def _apply_tx_images(embed, rbx_avatar, team, guild):
-    if rbx_avatar:
+def _apply_thumb(embed,team,guild,rbx_avatar=""):
+    """Team logo as thumbnail. Falls back to league logo."""
+    logo=team.get("logo_url","") if team else ""
+    if logo:
+        embed.set_thumbnail(url=logo)
+    elif rbx_avatar:
         embed.set_thumbnail(url=rbx_avatar)
-    elif team.get("logo_url"):
-        embed.set_thumbnail(url=team["logo_url"])
     else:
         lt=_league_thumb(guild)
         if lt: embed.set_thumbnail(url=lt)
 
-async def build_tx_embed(action, player, team, team_role, guild, color=UFF_COLOR):
+def _build_nfl_embed(team, guild, action_line:str, color:int, rbx_avatar:str="") -> discord.Embed:
+    """
+    NFL-style transaction embed:
+      Title  : "Team Name :verified: @LastWord"
+      Body   : action_line  (e.g. "are signing @player rbxname")
+      Footer : info_block + UFF footer
+      Thumb  : team logo
+      Color  : team color
+    """
+    verified   = get_verified_emoji(guild)
+    team_name  = team.get("name","") if team else ""
+    last        = _last_word(team_name)
+    emoji_pfx  = (team.get("emoji","")+" ") if team and team.get("emoji") else ""
+
+    title = f"{emoji_pfx}{team_name} {verified} @{last}"
+
+    desc  = f"{action_line}\n\n{_info_block(team)}" if team else action_line
+
+    embed = discord.Embed(title=title, description=desc, color=color)
+    embed.set_footer(text=UFF_FOOTER)
+    embed.timestamp = datetime.utcnow()
+    _apply_thumb(embed, team, guild, rbx_avatar)
+    return embed
+
+async def build_tx_embed(action:str, player:discord.Member, team:dict,
+                         team_role, guild:discord.Guild, color=UFF_COLOR) -> discord.Embed:
     blox       = await bloxlink_lookup(player.id, guild.id)
     rbx_name   = blox.get("roblox_username","Unknown")
     rbx_avatar = blox.get("avatar_url","")
-    emoji      = team.get("emoji","")
-    team_name  = team.get("name","")
-    prefix     = f"{emoji} " if emoji else ""
-    verified   = get_verified_emoji(guild)
+    rbx_part   = f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
+    action_line = f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part}"
+    return _build_nfl_embed(team, guild, action_line, color, rbx_avatar)
 
-    embed = discord.Embed(
-        description=_tx_desc(prefix, team_name, action, player, rbx_name, team, verified),
-        color=color,
-    )
-    embed.set_footer(text=UFF_FOOTER)
-    embed.timestamp = datetime.utcnow()
-    _apply_tx_images(embed, rbx_avatar, team, guild)
-    return embed
-
-async def build_coach_embed(action, player, team, team_role, guild, color=UFF_COLOR):
+async def build_coach_embed(action:str, player:discord.Member, team:dict,
+                             team_role, guild:discord.Guild, color=UFF_COLOR) -> discord.Embed:
     blox       = await bloxlink_lookup(player.id, guild.id)
     rbx_name   = blox.get("roblox_username","Unknown")
     rbx_avatar = blox.get("avatar_url","")
-    is_promo   = "promot" in action.lower()
-    role_lbl   = "assistant coach" if is_promo else "regular player"
-    emoji      = team.get("emoji","")
-    team_name  = team.get("name","")
-    prefix     = f"{emoji} " if emoji else ""
-    verified   = get_verified_emoji(guild)
-
-    embed = discord.Embed(
-        description=_coach_desc(prefix, team_name, action, player, rbx_name, role_lbl, team, verified),
-        color=color,
-    )
-    embed.set_footer(text=UFF_FOOTER)
-    embed.timestamp = datetime.utcnow()
-    _apply_tx_images(embed, rbx_avatar, team, guild)
-    return embed
+    rbx_part   = f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
+    role_lbl   = "assistant coach" if "promot" in action.lower() else "regular player"
+    action_line = f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part} to {role_lbl}"
+    return _build_nfl_embed(team, guild, action_line, color, rbx_avatar)
 
 async def post_tx(guild, embed, followup=None, msg="", ephemeral=True):
     ch=await get_tx_ch(guild)
     if ch:
         await ch.send(embed=embed)
-        if followup and msg: await followup.send(msg, ephemeral=ephemeral)
+        if followup and msg: await followup.send(msg,ephemeral=ephemeral)
     else:
         if followup:
-            try:    await followup.send(embed=embed)
+            try: await followup.send(embed=embed)
             except: pass
+
+# ── SCHEDULE PARSER ───────────────────────────────────────────────────
+def _strip_schedule_line(line:str) -> str:
+    """
+    Remove markdown, seeding numbers, annotations, and Discord mentions
+    so that a raw schedule line can be parsed for role names.
+    E.g.:
+      "#4 @Suva Stingrays vs @New York Dragons #3"
+      "**GOTW⭐ : #2** @Columbus Colts vs @Seminola Spartans #1"
+      "<@&123> vs <@&456>"
+    """
+    s = line
+    s = re.sub(r"\*+","",s)            # strip bold/italic markers
+    s = re.sub(r"#\d+","",s)           # strip seeding numbers
+    s = re.sub(r"\(edited\)","",s,flags=re.IGNORECASE)
+    s = re.sub(r"GOTW[^:]*:?","",s,flags=re.IGNORECASE)
+    s = re.sub(r"primetime[:\s]*","",s,flags=re.IGNORECASE)
+    s = re.sub(r"regular[:\s]*","",s,flags=re.IGNORECASE)
+    s = re.sub(r"match\s+\w+\s*\([^)]*\)","",s,flags=re.IGNORECASE)
+    s = re.sub(r"match\s+\w+","",s,flags=re.IGNORECASE)
+    return s.strip()
+
+def _find_role_in_text(text:str, guild:discord.Guild):
+    """
+    Extract a role from a text segment.
+    Handles: raw <@&ID>, plain @Team Name, or plain Team Name.
+    """
+    # Raw <@&ID> mention
+    m=re.search(r"<@&(\d+)>",text)
+    if m:
+        role=guild.get_role(int(m.group(1)))
+        if role: return role
+
+    # @Name or plain name — strip leading @
+    candidate=re.sub(r"^@","",text.strip()).strip()
+    # remove trailing seeding / junk digits
+    candidate=re.sub(r"\s*\d+$","",candidate).strip()
+    if not candidate: return None
+
+    lc=candidate.lower()
+    # exact full match
+    for role in guild.roles:
+        if role.name.lower()==lc: return role
+    # last-word match  ("@Spartans" → "Seminola Spartans")
+    for role in guild.roles:
+        if role.name.lower().split()[-1]==lc.split()[-1] and lc.split()[-1]: return role
+    # substring
+    for role in guild.roles:
+        if lc in role.name.lower(): return role
+    return None
+
+def _parse_schedule_pairs(text:str, guild:discord.Guild):
+    """
+    Return list of (role1, role2) for every valid 'A vs B' line in text.
+    Skips header-only lines that don't contain a 'vs'.
+    """
+    pairs=[]
+    for raw_line in text.splitlines():
+        line=_strip_schedule_line(raw_line)
+        # Must contain " vs " (case-insensitive) to be a matchup
+        parts=re.split(r"\s+vs\.?\s+",line,maxsplit=1,flags=re.IGNORECASE)
+        if len(parts)!=2:
+            continue
+        left,right=parts[0].strip(),parts[1].strip()
+        if not left or not right:
+            continue
+        r1=_find_role_in_text(left,guild)
+        r2=_find_role_in_text(right,guild)
+        if r1 and r2 and r1!=r2:
+            pairs.append((r1,r2))
+    return pairs
 
 # ── OFFER VIEW ────────────────────────────────────────────────────────
 class OfferView(discord.ui.View):
-    def __init__(self, offer_id, team_role_id, team_name, team_logo,
-                 team_emoji, hc_id, player_id, guild_id):
+    def __init__(self,offer_id,team_role_id,team_name,team_logo,team_emoji,hc_id,player_id,guild_id):
         super().__init__(timeout=43200)
         self.offer_id=offer_id; self.team_role_id=team_role_id; self.team_name=team_name
         self.team_logo=team_logo; self.team_emoji=team_emoji; self.hc_id=hc_id
@@ -507,11 +493,11 @@ class OfferView(discord.ui.View):
         data=await load_data(); guild=bot.get_guild(self.guild_id)
         if not guild:
             await interaction.edit_original_response(content="❌ Server not found.",view=self); return
-
         rid=str(self.team_role_id); team=data["teams"].get(rid)
         if not team:
             await interaction.edit_original_response(content="❌ Team no longer exists.",view=self); return
 
+        # FIX: fetch member FIRST
         try:
             player=(guild.get_member(self.player_id) or await guild.fetch_member(self.player_id))
         except discord.NotFound:
@@ -520,8 +506,7 @@ class OfferView(discord.ui.View):
         cur_rid,cur_team=get_player_team(data,player.id,player)
         if cur_team and cur_rid!=rid:
             await interaction.edit_original_response(
-                content=f"❌ You're already on **{cur_team['name']}**. Get released or demand first.",
-                view=self); return
+                content=f"❌ You're already on **{cur_team['name']}**. Get released or demand first.",view=self); return
 
         roster=team.setdefault("roster",[])
         if len(roster)>=MAX_ROSTER:
@@ -536,24 +521,12 @@ class OfferView(discord.ui.View):
 
         team_role=guild.get_role(int(rid)); role_failed=False
         if team_role:
-            try:   await player.add_roles(team_role,reason=f"Signed to {team['name']}")
+            try: await player.add_roles(team_role,reason=f"Signed to {team['name']}")
             except discord.Forbidden: role_failed=True
 
-        verified   = get_verified_emoji(guild)
-        team_name  = team.get("name","")
-        last_word  = _team_last_word(team_name)
-        emoji      = team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
-        rbx_part   = f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
-        embed=discord.Embed(
-            description=(
-                f"{prefix}{team_name} {verified} @{last_word} have **signed** "
-                f"{player.mention} (@{player.name}){rbx_part}!\n\n{_info_block(team)}"
-            ),
-            color=team.get("color",UFF_COLOR),
-        )
-        embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-        _apply_tx_images(embed,rbx_avatar,team,guild)
-
+        rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
+        action_line=f"are **signing** {player.mention} (@{player.name}){rbx_part}"
+        embed=_build_nfl_embed(team,guild,action_line,team.get("color",UFF_COLOR),rbx_avatar)
         ch=await get_tx_ch(guild)
         if ch: await ch.send(embed=embed)
 
@@ -628,7 +601,6 @@ class RankedPickupView(discord.ui.View):
             opponent=(guild.get_member(self.opponent_id) or await guild.fetch_member(self.opponent_id))
         except discord.NotFound:
             await interaction.edit_original_response(content="❌ Could not find players.",view=self); return
-
         p1=get_player(data,challenger.id); p2=get_player(data,opponent.id)
         r1,e1,_=get_rank(p1["elo"]); r2,e2,_=get_rank(p2["elo"])
         embed=discord.Embed(title="ranked pickup matchup",color=UFF_COLOR)
@@ -641,8 +613,7 @@ class RankedPickupView(discord.ui.View):
         if UFF_BANNER: embed.set_image(url=UFF_BANNER)
         lt=_league_thumb(guild)
         if lt: embed.set_thumbnail(url=lt)
-        embed.set_footer(text=f"✅ LIVE • /pickup_results when done | {UFF_FOOTER}")
-        embed.timestamp=datetime.utcnow()
+        embed.set_footer(text=f"✅ LIVE • /pickup_results when done | {UFF_FOOTER}"); embed.timestamp=datetime.utcnow()
         ch=await get_pickup_ch(guild)
         if ch:
             await ch.send(content=f"@everyone **Ranked Pickup** — **{challenger.display_name}** vs **{opponent.display_name}**",
@@ -714,8 +685,7 @@ class CasualPickupView(discord.ui.View):
         except discord.NotFound:
             await interaction.edit_original_response(content="❌ Could not find players.",view=self); return
         data=await load_data(); data.get("casual_pending",{}).pop(self.match_id,None)
-        opp_player=get_player(data,self.opponent_id); opp_player["last_game"]=datetime.utcnow().isoformat()
-        await save_data(data)
+        get_player(data,self.opponent_id)["last_game"]=datetime.utcnow().isoformat(); await save_data(data)
         embed=discord.Embed(title="casual pickup matchup",color=CASUAL_COLOR)
         embed.add_field(name=f"🟡 {challenger.display_name}",value=f"{challenger.mention}\n**{self.challenger_team}**",inline=True)
         embed.add_field(name="\u200b",value="**— VS —**",inline=True)
@@ -770,21 +740,20 @@ async def _run_casual(interaction,opponent,game_link,your_team,opponent_team):
         await interaction.followup.send("❌ Can't challenge yourself!",ephemeral=True); return
     if opponent.bot:
         await interaction.followup.send("❌ Can't challenge a bot!",ephemeral=True); return
-    data=await load_data(); _expire_casual_pending(data)
+    data=await load_data(); _expire_casual(data)
     uid=str(interaction.user.id); oid=str(opponent.id)
     for m in data.get("casual_pending",{}).values():
         if m["challenger_id"]==uid or m["opponent_id"]==uid:
-            await interaction.followup.send("❌ You already have a pending casual. Wait for it to resolve first.",ephemeral=True); return
+            await interaction.followup.send("❌ You already have a pending casual.",ephemeral=True); return
         if m["challenger_id"]==oid or m["opponent_id"]==oid:
             await interaction.followup.send(f"❌ **{opponent.display_name}** already has a pending casual.",ephemeral=True); return
-    c_player=get_player(data,interaction.user.id); c_player["last_game"]=datetime.utcnow().isoformat()
+    get_player(data,interaction.user.id)["last_game"]=datetime.utcnow().isoformat()
     mid=f"casual_{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
     data.setdefault("casual_pending",{})[mid]={
         "challenger_id":str(interaction.user.id),"opponent_id":str(opponent.id),
         "challenger_name":interaction.user.display_name,"opponent_name":opponent.display_name,
         "challenger_team":your_team,"opponent_team":opponent_team,"game_link":game_link,
-        "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id,
-    }
+        "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id}
     await save_data(data)
     lt=_league_thumb(interaction.guild)
     dm=discord.Embed(title="🏈 Casual Pickup Challenge!",
@@ -799,8 +768,7 @@ async def _run_casual(interaction,opponent,game_link,your_team,opponent_team):
     dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
     view=CasualPickupView(mid,interaction.user.id,opponent.id,interaction.user.display_name,
         opponent.display_name,your_team,opponent_team,game_link,interaction.guild.id)
-    try:
-        await opponent.send(embed=dm,view=view)
+    try: await opponent.send(embed=dm,view=view)
     except discord.Forbidden:
         data.get("casual_pending",{}).pop(mid,None); await save_data(data)
         await interaction.followup.send(f"❌ Can't DM **{opponent.display_name}**.",ephemeral=True); return
@@ -835,8 +803,7 @@ class SuspReasonSelect(discord.ui.Select):
         await interaction.response.edit_message(content=p,view=v)
 
 class SuspConfirmBtn(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="✅ Confirm & Post",style=discord.ButtonStyle.success,row=1)
+    def __init__(self): super().__init__(label="✅ Confirm & Post",style=discord.ButtonStyle.success,row=1)
     async def callback(self,interaction:discord.Interaction):
         v:SuspView=self.view
         if not v.selected:
@@ -857,7 +824,7 @@ class SuspConfirmBtn(discord.ui.Button):
             await ch.send(embed=embed)
             susp_role=interaction.guild.get_role(SUSPENSION_ROLE_ID)
             if susp_role:
-                try:   await v.target.add_roles(susp_role,reason="Suspended via /suspension")
+                try: await v.target.add_roles(susp_role,reason="Suspended via /suspension")
                 except discord.Forbidden: pass
             await interaction.edit_original_response(content=f"✅ Posted to {ch.mention}. Suspension role applied.",view=v)
             nk=[r for r in v.selected if r in SUSPENSION_REASONS]
@@ -869,22 +836,20 @@ class SuspConfirmBtn(discord.ui.Button):
                 "status_flags":[SPECIAL_SUSPENSION_REASONS[r] for r in sk],
                 "total_games":total,"issued_by":str(interaction.user.id),
                 "issued_by_name":interaction.user.display_name,
-                "date":datetime.utcnow().isoformat(),"cleared":False,
-            })
+                "date":datetime.utcnow().isoformat(),"cleared":False})
             await save_data(data)
         else:
             await interaction.edit_original_response(content="❌ Suspension channel not found.",view=v)
 
 class SuspCancelBtn(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Cancel",style=discord.ButtonStyle.secondary,row=1)
+    def __init__(self): super().__init__(label="Cancel",style=discord.ButtonStyle.secondary,row=1)
     async def callback(self,interaction:discord.Interaction):
         v:SuspView=self.view
         for item in v.children: item.disabled=True
         await interaction.response.edit_message(content="❌ Cancelled.",view=v); v.stop()
 
 class SuspView(discord.ui.View):
-    def __init__(self,target:discord.Member,issuer_id:int):
+    def __init__(self,target,issuer_id):
         super().__init__(timeout=300)
         self.target=target; self.issuer_id=issuer_id; self.selected=[]
         self.add_item(SuspReasonSelect()); self.add_item(SuspConfirmBtn()); self.add_item(SuspCancelBtn())
@@ -909,20 +874,17 @@ async def on_app_command_error(interaction:discord.Interaction,error:app_command
     except: pass
 
 @bot.event
-async def on_error(event:str,*args,**kwargs):
-    import traceback
-    print(f"[ERROR] Unhandled exception in event '{event}':"); traceback.print_exc()
+async def on_error(event,*args,**kwargs):
+    import traceback; print(f"[ERROR] {event}:"); traceback.print_exc()
 
 @bot.event
 async def on_ready():
     await init_db()
     guild_obj=discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild_obj)
-    await bot.tree.sync(guild=guild_obj)
-    await bot.tree.sync()
-    print(f"✅ UFF Bot online — {bot.user}")
+    await bot.tree.sync(guild=guild_obj); await bot.tree.sync()
+    print(f"✅ UFF Bot v6.1 online — {bot.user}")
     print(f"   Transactions : {TRANSACTIONS_CHANNEL_ID}")
-    print(f"   Stream ch    : {STREAM_CHANNEL_ID}")
     print(f"   Bloxlink     : {'SET' if BLOXLINK_API_KEY else 'NOT SET'}")
     print(f"   Database     : {'SET' if DATABASE_URL else 'NOT SET'}")
 
@@ -946,8 +908,7 @@ async def set_team(interaction:discord.Interaction,team_role:discord.Role):
         "head_coach_roblox":ex.get("head_coach_roblox",""),
         "ahc_id":ex.get("ahc_id"),"ahc_name":ex.get("ahc_name"),"ahc_roblox":ex.get("ahc_roblox",""),
         "logo_url":logo_url or ex.get("logo_url",""),"emoji":ex.get("emoji",""),
-        "roster":ex.get("roster",[]),"color":team_role.color.value or UFF_COLOR,
-    }
+        "roster":ex.get("roster",[]),"color":team_role.color.value or UFF_COLOR}
     await save_data(data)
     embed=discord.Embed(title="team registered",color=UFF_COLOR,
         description=f"**{team_name}** registered!\nRole: {team_role.mention} | Transactions → <#{TRANSACTIONS_CHANNEL_ID}>")
@@ -968,8 +929,7 @@ async def set_team_image(interaction:discord.Interaction,team_role:discord.Role,
     if rid not in data["teams"]:
         await interaction.followup.send(f"❌ {team_role.mention} not registered.",ephemeral=True); return
     data["teams"][rid]["logo_url"]=logo_url; await save_data(data)
-    embed=discord.Embed(title="logo updated",color=UFF_COLOR,
-        description=f"Logo for **{data['teams'][rid]['name']}** updated.")
+    embed=discord.Embed(title="logo updated",color=UFF_COLOR,description=f"Logo for **{data['teams'][rid]['name']}** updated.")
     embed.set_thumbnail(url=logo_url)
     await interaction.followup.send(embed=embed,ephemeral=True)
 
@@ -983,12 +943,12 @@ async def set_team_emoji(interaction:discord.Interaction,team_role:discord.Role,
         await interaction.followup.send("❌ Staff only.",ephemeral=True); return
     data=await load_data(); rid=str(team_role.id)
     if rid not in data["teams"]:
-        await interaction.followup.send(f"❌ {team_role.mention} not registered. Use `/set_team` first.",ephemeral=True); return
+        await interaction.followup.send(f"❌ {team_role.mention} not registered.",ephemeral=True); return
     data["teams"][rid]["emoji"]=emoji.strip(); await save_data(data)
     await interaction.followup.send(f"✅ Emoji for **{data['teams'][rid]['name']}** set to {emoji}",ephemeral=True)
 
 
-@bot.tree.command(name="sync_roster",description="[Staff] Fully sync the roster to match who has the team role")
+@bot.tree.command(name="sync_roster",description="[Staff] Sync roster to match who has the team role")
 @app_commands.describe(team_role="The team's Discord role to sync from")
 @app_commands.default_permissions(administrator=True)
 async def sync_roster(interaction:discord.Interaction,team_role:discord.Role):
@@ -1003,11 +963,10 @@ async def sync_roster(interaction:discord.Interaction,team_role:discord.Role):
     new_roster=[]
     for member in team_role.members:
         mid=str(member.id)
-        if mid in old_data: new_roster.append(old_data[mid])
-        else: new_roster.append({"id":mid,"name":member.display_name,"roblox":"","role":"Player"})
+        new_roster.append(old_data[mid] if mid in old_data
+                          else {"id":mid,"name":member.display_name,"roblox":"","role":"Player"})
     team["roster"]=new_roster
-    new_ids={str(m.id) for m in team_role.members}
-    added=len(new_ids-old_ids); removed=len(old_ids-new_ids)
+    new_ids={str(m.id) for m in team_role.members}; added=len(new_ids-old_ids); removed=len(old_ids-new_ids)
     hc_id=team.get("head_coach_id"); hc_cleared=False
     if hc_id:
         hc_m=interaction.guild.get_member(int(hc_id))
@@ -1020,31 +979,30 @@ async def sync_roster(interaction:discord.Interaction,team_role:discord.Role):
             team.update(ahc_id=None,ahc_name=None,ahc_roblox=""); ahc_cleared=True
     hc_role_obj=interaction.guild.get_role(HEAD_COACH_ROLE_ID)
     ahc_role_obj=interaction.guild.get_role(ASSISTANT_COACH_ROLE_ID)
-    hc_detected=False; ahc_detected=False
+    hc_det=False; ahc_det=False
     for member in team_role.members:
         mid=str(member.id)
-        if hc_role_obj and hc_role_obj in member.roles and not hc_detected:
+        if hc_role_obj and hc_role_obj in member.roles and not hc_det:
             team["head_coach_id"]=mid; team["head_coach_name"]=member.name
             if not team.get("head_coach_roblox"): team["head_coach_roblox"]=""
-            hc_detected=True; hc_cleared=False
+            hc_det=True; hc_cleared=False
             for r in team["roster"]:
                 if r["id"]==mid: r["role"]="Head Coach"
-        elif ahc_role_obj and ahc_role_obj in member.roles and not ahc_detected:
+        elif ahc_role_obj and ahc_role_obj in member.roles and not ahc_det:
             team["ahc_id"]=mid; team["ahc_name"]=member.name
             if not team.get("ahc_roblox"): team["ahc_roblox"]=""
-            ahc_detected=True; ahc_cleared=False
+            ahc_det=True; ahc_cleared=False
             for r in team["roster"]:
                 if r["id"]==mid: r["role"]="Assistant Head Coach"
     await save_data(data)
     notes=[]
-    if hc_detected:  notes.append("✅ Head coach auto-detected from role")
-    if ahc_detected: notes.append("✅ AHC auto-detected from role")
-    if hc_cleared:   notes.append("⚠️ Head coach cleared (no longer has the team role)")
-    if ahc_cleared:  notes.append("⚠️ AHC cleared (no longer has the team role)")
+    if hc_det:     notes.append("✅ Head coach auto-detected")
+    if ahc_det:    notes.append("✅ AHC auto-detected")
+    if hc_cleared: notes.append("⚠️ Head coach cleared")
+    if ahc_cleared:notes.append("⚠️ AHC cleared")
     note_str="\n"+"\n".join(notes) if notes else ""
     await interaction.followup.send(
-        f"✅ **{team['name']}** roster synced.\n**{len(new_roster)}/{MAX_ROSTER}** | +{added} added | -{removed} removed{note_str}",
-        ephemeral=True)
+        f"✅ **{team['name']}** synced. **{len(new_roster)}/{MAX_ROSTER}** | +{added} / -{removed}{note_str}",ephemeral=True)
 
 
 @bot.tree.command(name="assign_hc",description="[Staff] Assign a head coach to a team")
@@ -1072,9 +1030,9 @@ async def assign_hc(interaction:discord.Interaction,team_role:discord.Role,playe
     await save_data(data)
     hc_role=interaction.guild.get_role(HEAD_COACH_ROLE_ID); rf=False
     if hc_role:
-        try:   await player.add_roles(hc_role,reason="Assigned HC via /assign_hc")
+        try: await player.add_roles(hc_role,reason="Assigned HC")
         except discord.Forbidden: rf=True
-    msg=f"✅ **{player.display_name}** is now head coach of **{team['name']}**."
+    msg=f"✅ **{player.display_name}** is now HC of **{team['name']}**."
     if rf: msg+=_role_warn("Head Coach")
     await interaction.followup.send(msg,ephemeral=True)
 
@@ -1085,8 +1043,8 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     data=await load_data(); rid,team=get_team_for_user(data,interaction.user.id,interaction.user)
     if not team:
-        msg="❌ Staff: assign yourself as HC first." if is_staff(interaction) else "❌ You're not HC or AHC of any team."
-        await interaction.followup.send(msg,ephemeral=True); return
+        await interaction.followup.send("❌ Staff: assign yourself as HC first." if is_staff(interaction)
+                                        else "❌ You're not HC or AHC of any team.",ephemeral=True); return
     if player.id==interaction.user.id:
         await interaction.followup.send("❌ Can't offer yourself.",ephemeral=True); return
     if player.bot:
@@ -1097,8 +1055,7 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
     cur_rid,cur_team=get_player_team(data,player.id,player)
     if cur_team:
         await interaction.followup.send(
-            f"❌ **{player.display_name}** is already on **{cur_team['name']}**. They must be released or demand first.",
-            ephemeral=True); return
+            f"❌ **{player.display_name}** is already on **{cur_team['name']}**.",ephemeral=True); return
     oid=f"offer_{rid}_{player.id}_{int(datetime.utcnow().timestamp())}"
     team_logo=team.get("logo_url",""); team_emoji=team.get("emoji",""); hc_id=team.get("head_coach_id")
     data.setdefault("offers",{})[oid]={"team_role_id":rid,"team_name":team["name"],"player_id":str(player.id),
@@ -1114,8 +1071,7 @@ async def offer(interaction:discord.Interaction,player:discord.Member):
     if thumb: dm.set_thumbnail(url=thumb)
     dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
     view=OfferView(oid,int(rid),team["name"],team_logo,team_emoji,hc_id,player.id,interaction.guild.id)
-    try:
-        await player.send(embed=dm,view=view)
+    try: await player.send(embed=dm,view=view)
     except discord.Forbidden:
         data.get("offers",{}).pop(oid,None); await save_data(data)
         await interaction.followup.send(f"❌ Can't DM **{player.display_name}**.",ephemeral=True); return
@@ -1132,7 +1088,7 @@ async def release(interaction:discord.Interaction,player:discord.Member):
     if not team and is_staff(interaction):
         rid,team=get_player_team(data,player.id,player)
         if not team:
-            await interaction.followup.send(f"❌ {player.display_name} isn't on any registered team.",ephemeral=True); return
+            await interaction.followup.send(f"❌ {player.display_name} isn't on any team.",ephemeral=True); return
     team_role_obj=get_role(interaction.guild,rid)
     in_db=any(r["id"]==str(player.id) for r in team.get("roster",[]))
     has_role=team_role_obj is not None and team_role_obj in player.roles
@@ -1143,7 +1099,7 @@ async def release(interaction:discord.Interaction,player:discord.Member):
     await save_data(data)
     rf=False
     if team_role_obj and team_role_obj in player.roles:
-        try:   await player.remove_roles(team_role_obj,reason=f"Released from {team['name']}")
+        try: await player.remove_roles(team_role_obj,reason=f"Released from {team['name']}")
         except discord.Forbidden: rf=True
     embed=await build_tx_embed("released",player,team,team_role_obj,interaction.guild,color=0xED4245)
     msg=f"✅ Released **{player.display_name}** from **{team['name']}**."
@@ -1151,16 +1107,16 @@ async def release(interaction:discord.Interaction,player:discord.Member):
     await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
 
 
-@bot.tree.command(name="demand",description="Demand a release from your current team (1 per player lifetime)")
+@bot.tree.command(name="demand",description="Demand a release from your team (1 lifetime)")
 async def demand(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True,thinking=True)
     data=await load_data(); uid=str(interaction.user.id)
     found_rid,found_team=get_player_team(data,uid,interaction.user)
     if not found_team:
-        await interaction.followup.send("❌ You aren't on any registered team. If you have a team role but this is failing, ask staff to run `/sync_roster`.",ephemeral=True); return
+        await interaction.followup.send("❌ You aren't on any registered team.",ephemeral=True); return
     extra=data.get("extra_demands",{}).get(uid,0)
     if data.get("demand_used",{}).get(uid,False) and extra<=0:
-        await interaction.followup.send("❌ You've already used your demand. Players get **1 demand** lifetime.\nAsk an admin for `/grant_extra_demand`.",ephemeral=True); return
+        await interaction.followup.send("❌ Already used your demand. Ask admin for `/grant_extra_demand`.",ephemeral=True); return
     if data.get("demand_used",{}).get(uid,False): data["extra_demands"][uid]=extra-1
     else: data.setdefault("demand_used",{})[uid]=True
     for t in data["teams"].values():
@@ -1170,23 +1126,11 @@ async def demand(interaction:discord.Interaction):
     rbx_name=blox.get("roblox_username","Unknown"); rbx_avatar=blox.get("avatar_url","")
     team_role=get_role(interaction.guild,found_rid); rf=False
     if team_role and team_role in interaction.user.roles:
-        try:   await interaction.user.remove_roles(team_role,reason=f"Demand from {found_team['name']}")
+        try: await interaction.user.remove_roles(team_role,reason=f"Demand from {found_team['name']}")
         except discord.Forbidden: rf=True
-    emoji=found_team.get("emoji",""); prefix=f"{emoji} " if emoji else ""
-    team_name=found_team.get("name",""); last_word=_team_last_word(team_name)
-    verified=get_verified_emoji(interaction.guild)
     rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
-    embed=discord.Embed(
-        description=(
-            f"{interaction.user.mention} (@{interaction.user.name}){rbx_part} "
-            f"has demanded a release from {prefix}{team_name} {verified} @{last_word}!\n\n"
-            f"{_info_block(found_team)}"
-        ),
-        color=0xED4245,
-    )
-    embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    if rbx_avatar: embed.set_thumbnail(url=rbx_avatar)
-    elif found_team.get("logo_url"): embed.set_thumbnail(url=found_team["logo_url"])
+    action_line=f"{interaction.user.mention} (@{interaction.user.name}){rbx_part} has **demanded** a release"
+    embed=_build_nfl_embed(found_team,interaction.guild,action_line,0xED4245,rbx_avatar)
     msg=f"✅ Your demand from **{found_team['name']}** has been posted."
     if rf: msg+=_role_warn(found_team["name"])
     await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
@@ -1214,10 +1158,10 @@ async def promote_coach(interaction:discord.Interaction,player:discord.Member):
         for r,t in data["teams"].items():
             if any(x["id"]==str(player.id) for x in t.get("roster",[])): rid,team=r,t; break
     if not team:
-        await interaction.followup.send("❌ You're not HC of any team. Only HCs and staff can promote.",ephemeral=True); return
+        await interaction.followup.send("❌ You're not HC of any team.",ephemeral=True); return
     roster=team.setdefault("roster",[])
     if not any(r["id"]==str(player.id) for r in roster):
-        await interaction.followup.send(f"❌ {player.display_name} must be on the roster first.",ephemeral=True); return
+        await interaction.followup.send(f"❌ {player.display_name} must be on roster first.",ephemeral=True); return
     blox=await bloxlink_lookup(player.id,interaction.guild.id); rbx=blox.get("roblox_username","")
     team.update(ahc_id=str(player.id),ahc_name=player.name,ahc_roblox=rbx)
     for r in roster:
@@ -1247,7 +1191,7 @@ async def demote_coach(interaction:discord.Interaction,player:discord.Member):
     if not team:
         await interaction.followup.send("❌ You're not HC of any team.",ephemeral=True); return
     if team.get("ahc_id")!=str(player.id):
-        await interaction.followup.send(f"❌ {player.display_name} is not the AHC of **{team['name']}**.",ephemeral=True); return
+        await interaction.followup.send(f"❌ {player.display_name} is not AHC of **{team['name']}**.",ephemeral=True); return
     team.update(ahc_id=None,ahc_name=None,ahc_roblox="")
     for r in team.get("roster",[]):
         if r["id"]==str(player.id): r["role"]="Player"
@@ -1264,7 +1208,7 @@ async def demote_coach(interaction:discord.Interaction,player:discord.Member):
 
 
 @bot.tree.command(name="disband",description="Disband a team — removes all players and coaches")
-@app_commands.describe(confirm="Type DISBAND to confirm",team_role="(Staff only) Target team — HCs don't need this")
+@app_commands.describe(confirm="Type DISBAND to confirm",team_role="(Staff only) Target team")
 async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.Role=None):
     await interaction.response.defer(ephemeral=True)
     if confirm.upper()!="DISBAND":
@@ -1273,9 +1217,10 @@ async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.
     if not team and is_staff(interaction) and team_role:
         rid=str(team_role.id); team=get_team_by_role(data,team_role.id)
     if not team:
-        await interaction.followup.send("❌ Not HC of any team. Staff must also provide team_role.",ephemeral=True); return
+        await interaction.followup.send("❌ Not HC. Staff must also provide team_role.",ephemeral=True); return
     team_name=team["name"]; former=list(team.get("roster",[])); former_size=len(former)
-    team.update(roster=[],head_coach_id=None,head_coach_name=None,head_coach_roblox="",ahc_id=None,ahc_name=None,ahc_roblox="")
+    team.update(roster=[],head_coach_id=None,head_coach_name=None,head_coach_roblox="",
+                ahc_id=None,ahc_name=None,ahc_roblox="")
     await save_data(data)
     tr=get_role(interaction.guild,rid); fail=0
     if tr:
@@ -1286,12 +1231,11 @@ async def disband(interaction:discord.Interaction,confirm:str,team_role:discord.
             except discord.Forbidden: fail+=1
             except: pass
     embed=discord.Embed(title="team disbanded",color=0xED4245,
-        description=f"**{team_name}** has been disbanded.\nAll **{former_size}** players and coaches removed.")
+        description=f"**{team_name}** disbanded.\n**{former_size}** players removed.")
     if tr: embed.add_field(name="Team",value=tr.mention,inline=True)
     logo=team.get("logo_url","") or _league_thumb(interaction.guild)
     if logo: embed.set_thumbnail(url=logo)
-    embed.set_footer(text=f"Disbanded by {interaction.user.display_name} | {UFF_FOOTER}")
-    embed.timestamp=datetime.utcnow()
+    embed.set_footer(text=f"Disbanded by {interaction.user.display_name} | {UFF_FOOTER}"); embed.timestamp=datetime.utcnow()
     note=f"\n⚠️ Couldn't strip role from {fail} member(s)." if fail else ""
     ch=await get_tx_ch(interaction.guild)
     if ch:
@@ -1342,8 +1286,8 @@ async def coaches_cmd(interaction:discord.Interaction):
     else:
         lines=[]
         for rid,team in teams.items():
-            hc_id=team.get("head_coach_id"); hc_name=team.get("head_coach_name","")
-            hc_rbx=team.get("head_coach_roblox",""); team_emoji=team.get("emoji","")
+            hc_id=team.get("head_coach_id"); hc_name=team.get("head_coach_name",""); hc_rbx=team.get("head_coach_roblox","")
+            team_emoji=team.get("emoji","")
             if hc_id:
                 rbx_str=f" `{hc_rbx}`" if hc_rbx else ""
                 hc_str=f"<@{hc_id}> (@{hc_name}) ✓{rbx_str}"
@@ -1369,10 +1313,9 @@ async def coaches_cmd(interaction:discord.Interaction):
 # ══════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="stream_post",description="[Staff] Post a stream announcement")
-@app_commands.describe(season="Season number (e.g. 5)",series="Series label (e.g. II or 2)",
-    team1="First team role",team1_record="Team 1 record (e.g. 2-0)",
-    team2="Second team role",team2_record="Team 2 record (e.g. 3-0)",
-    stream_url="Stream link")
+@app_commands.describe(season="Season number",series="Series label",
+    team1="First team role",team1_record="Team 1 record",
+    team2="Second team role",team2_record="Team 2 record",stream_url="Stream link")
 async def stream_post(interaction:discord.Interaction,season:str,series:str,
     team1:discord.Role,team1_record:str,team2:discord.Role,team2_record:str,stream_url:str):
     await interaction.response.defer(ephemeral=True)
@@ -1381,9 +1324,9 @@ async def stream_post(interaction:discord.Interaction,season:str,series:str,
     ch=await get_stream_ch(interaction.guild)
     if not ch:
         await interaction.followup.send("❌ Stream channel not found.",ephemeral=True); return
-    content=(f"@here\n**Season {season} - Series {series}**\n"
-             f"{team1.mention} ({team1_record}) vs {team2.mention} ({team2_record})\n{stream_url}")
-    await ch.send(content=content,allowed_mentions=discord.AllowedMentions(everyone=True,roles=True))
+    await ch.send(
+        content=f"@here\n**Season {season} - Series {series}**\n{team1.mention} ({team1_record}) vs {team2.mention} ({team2_record})\n{stream_url}",
+        allowed_mentions=discord.AllowedMentions(everyone=True,roles=True))
     await interaction.followup.send(f"✅ Stream post sent to {ch.mention}!",ephemeral=True)
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1406,13 +1349,13 @@ async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,
     uid=str(interaction.user.id); oid=str(opponent.id)
     for m in data.get("pending",{}).values():
         if m["challenger_id"]==uid or m["opponent_id"]==uid:
-            await interaction.followup.send("❌ You already have an active pending challenge. Submit results or wait for it to expire (30 min).",ephemeral=True); return
+            await interaction.followup.send("❌ You already have an active pending challenge.",ephemeral=True); return
         if m["challenger_id"]==oid or m["opponent_id"]==oid:
             await interaction.followup.send(f"❌ **{opponent.display_name}** already has a pending challenge.",ephemeral=True); return
     cd,remaining=on_cooldown(data,interaction.user.id)
     if cd:
         e=discord.Embed(title="⏳ cooldown active",
-            description=f"You can challenge again in **{remaining}**. Cooldown: `{COOLDOWN_MINUTES} min` from when your last game went live.",color=0xE84040)
+            description=f"You can challenge again in **{remaining}**. Cooldown: `{COOLDOWN_MINUTES} min`.",color=0xE84040)
         e.set_footer(text=UFF_FOOTER)
         await interaction.followup.send(embed=e,ephemeral=True); return
     p1=get_player(data,interaction.user.id); p1["username"]=interaction.user.display_name
@@ -1423,8 +1366,7 @@ async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,
         "challenger_id":str(interaction.user.id),"opponent_id":str(opponent.id),
         "challenger_name":interaction.user.display_name,"opponent_name":opponent.display_name,
         "challenger_team":your_team,"opponent_team":opponent_team,"game_link":game_link,
-        "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id,
-    }
+        "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id}
     await save_data(data)
     r1,e1,_=get_rank(p1["elo"]); r2,e2,_=get_rank(p2["elo"]); lt=_league_thumb(interaction.guild)
     dm=discord.Embed(title="🏈 Ranked Pickup Challenge!",
@@ -1438,8 +1380,7 @@ async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,
     dm.set_footer(text=f"Challenge by {interaction.user.display_name} | {UFF_FOOTER}"); dm.timestamp=datetime.utcnow()
     view=RankedPickupView(mid,interaction.user.id,opponent.id,interaction.user.display_name,
         opponent.display_name,your_team,opponent_team,game_link,interaction.guild.id)
-    try:
-        await opponent.send(embed=dm,view=view)
+    try: await opponent.send(embed=dm,view=view)
     except discord.Forbidden:
         data.get("pending",{}).pop(mid,None); await save_data(data)
         await interaction.followup.send(f"❌ Can't DM **{opponent.display_name}**.",ephemeral=True); return
@@ -1450,12 +1391,12 @@ async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,
 
 
 @bot.tree.command(name="pickup_casual",description="Challenge to a casual pickup — no ELO")
-@app_commands.describe(opponent="Player to challenge",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
+@app_commands.describe(opponent="Player",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
 async def pickup_casual(interaction,opponent:discord.Member,game_link:str,your_team:str,opponent_team:str):
     await _run_casual(interaction,opponent,game_link,your_team,opponent_team)
 
 @bot.tree.command(name="casual_pickup",description="Challenge to a casual pickup — no ELO")
-@app_commands.describe(opponent="Player to challenge",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
+@app_commands.describe(opponent="Player",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
 async def casual_pickup(interaction,opponent:discord.Member,game_link:str,your_team:str,opponent_team:str):
     await _run_casual(interaction,opponent,game_link,your_team,opponent_team)
 
@@ -1479,12 +1420,10 @@ async def pickup_results(interaction:discord.Interaction,winner:discord.Member,
     wp=get_player(data,winner.id); lp=get_player(data,loser_id); wp["username"]=winner.display_name
     old_w,old_l=wp["elo"],lp["elo"]
     wp["elo"]+=WIN_ELO; lp["elo"]=max(0,lp["elo"]-LOSS_ELO); wp["wins"]+=1; lp["losses"]+=1
-    now=datetime.utcnow().isoformat()
     data.setdefault("matches",[]).append({
         "winner_id":str(winner.id),"winner_name":winner.display_name,"loser_id":str(loser_id),"loser_name":loser_name,
         "winner_score":winner_score,"loser_score":loser_score,
-        "challenger_team":match["challenger_team"],"opponent_team":match["opponent_team"],"date":now,
-    })
+        "challenger_team":match["challenger_team"],"opponent_team":match["opponent_team"],"date":datetime.utcnow().isoformat()})
     data.get("pending",{}).pop(mkey,None); await save_data(data)
     wr,we,wcolor=get_rank(wp["elo"]); lr,le,_=get_rank(lp["elo"]); lt=_league_thumb(interaction.guild)
     embed=discord.Embed(title="🏆 pickup results",color=wcolor)
@@ -1571,7 +1510,6 @@ async def reset_player(interaction:discord.Interaction,player:discord.Member):
     await save_data(data)
     await interaction.followup.send(f"✅ Reset **{player.display_name}** ELO to `{STARTING_ELO}`.",ephemeral=True)
 
-
 @bot.tree.command(name="adjust_elo",description="[Admin] Manually adjust a player's ELO")
 @app_commands.describe(player="Target player",amount="ELO to add (negative to subtract)")
 @app_commands.default_permissions(administrator=True)
@@ -1583,7 +1521,6 @@ async def adjust_elo(interaction:discord.Interaction,player:discord.Member,amoun
     p["elo"]=max(0,p["elo"]+amount); p["username"]=player.display_name; await save_data(data)
     sign="+" if amount>=0 else ""
     await interaction.followup.send(f"✅ **{player.display_name}** ELO: `{old}` → `{p['elo']}` ({sign}{amount})",ephemeral=True)
-
 
 @bot.tree.command(name="clear_cooldown",description="[Admin] Clear a player's cooldown")
 @app_commands.describe(player="Player to clear")
@@ -1600,29 +1537,27 @@ async def clear_cooldown(interaction:discord.Interaction,player:discord.Member):
 @app_commands.describe(player="The player to suspend")
 async def suspension(interaction:discord.Interaction,player:discord.Member):
     if not can_issue_suspension(interaction):
-        await interaction.response.send_message("❌ No permission to issue suspensions.",ephemeral=True); return
+        await interaction.response.send_message("❌ No permission.",ephemeral=True); return
     view=SuspView(target=player,issuer_id=interaction.user.id)
     await interaction.response.send_message(
         content=f"**Issuing suspension for {player.display_name}**\nSelect up to {MAX_SUSPENSION_REASONS} reasons.",
         view=view,ephemeral=True)
-
 
 @bot.tree.command(name="unsuspend",description="[Staff] Clear a player's suspension")
 @app_commands.describe(player="The player to unsuspend")
 async def unsuspend(interaction:discord.Interaction,player:discord.Member):
     await interaction.response.defer(ephemeral=True)
     if not can_issue_suspension(interaction):
-        await interaction.followup.send("❌ No permission to clear suspensions.",ephemeral=True); return
+        await interaction.followup.send("❌ No permission.",ephemeral=True); return
     data=await load_data(); cleared=False
     for s in data.get("suspensions",[]):
         if s.get("player_id")==str(player.id) and not s.get("cleared",False):
             s.update(cleared=True,cleared_by=str(interaction.user.id),
-                cleared_by_name=interaction.user.display_name,cleared_date=datetime.utcnow().isoformat())
-            cleared=True
+                cleared_by_name=interaction.user.display_name,cleared_date=datetime.utcnow().isoformat()); cleared=True
     await save_data(data)
     susp_role=interaction.guild.get_role(SUSPENSION_ROLE_ID); role_removed=False
     if susp_role and susp_role in player.roles:
-        try:   await player.remove_roles(susp_role,reason="Unsuspended via /unsuspend"); role_removed=True
+        try: await player.remove_roles(susp_role,reason="Unsuspended"); role_removed=True
         except discord.Forbidden: pass
     embed=discord.Embed(title="player unsuspended",color=0x57F287)
     embed.add_field(name="Player",value=f"<@{player.id}> ({player.display_name})",inline=False)
@@ -1632,12 +1567,11 @@ async def unsuspend(interaction:discord.Interaction,player:discord.Member):
     ch=await get_susp_ch(interaction.guild)
     if ch:
         await ch.send(embed=embed)
-        note="" if cleared else "\n*(No open records found, notice posted anyway.)*"
-        rnote="" if role_removed else "\n⚠️ Suspension role couldn't be removed automatically."
+        note="" if cleared else "\n*(No open records found.)*"
+        rnote="" if role_removed else "\n⚠️ Suspension role couldn't be removed."
         await interaction.followup.send(f"✅ {player.display_name} unsuspended. Posted to {ch.mention}.{note}{rnote}",ephemeral=True)
     else:
         await interaction.followup.send("❌ Suspension channel not found.",ephemeral=True)
-
 
 @bot.tree.command(name="help_uff",description="UFF bot command guide")
 async def help_uff(interaction:discord.Interaction):
@@ -1646,7 +1580,7 @@ async def help_uff(interaction:discord.Interaction):
         "`/set_team` `/set_team_image` `/set_team_emoji` `/sync_roster`\n"
         "`/assign_hc` `/offer` `/release` `/demand` `/grant_extra_demand`\n"
         "`/promote_coach` `/demote_coach` `/disband` `/roster` `/coaches`"),inline=False)
-    embed.add_field(name="🧵 Scheduling",value="`/thread_create` `/thread_delete` `/schedule`",inline=False)
+    embed.add_field(name="🧵 Scheduling",value="`/schedule` `/thread_create` `/thread_delete`",inline=False)
     embed.add_field(name="📺 Stream",value="`/stream_post`",inline=False)
     embed.add_field(name="⚔️ Ranked Pickup",value="`/pickup_ranked` `/pickup_results` `/pickup_profile` `/pickup_leaderboard` `/match_history`",inline=False)
     embed.add_field(name="🎮 Casual",value="`/pickup_casual` or `/casual_pickup`",inline=False)
@@ -1665,61 +1599,47 @@ async def help_uff(interaction:discord.Interaction):
 # SCHEDULING THREAD COMMANDS
 # ══════════════════════════════════════════════════════════════════════
 
-async def _create_scheduling_thread(interaction, role1, role2, t1, t2, data):
-    """
-    Shared logic for both /thread_create and /schedule.
-    Returns the created thread or raises on error.
-    """
+async def _make_thread(interaction, role1, role2, t1, t2):
+    """Create a single private scheduling thread for two teams."""
     e1=(t1.get("emoji","")+" ") if t1 and t1.get("emoji") else ""
     e2=(t2.get("emoji","")+" ") if t2 and t2.get("emoji") else ""
     name1=t1["name"] if t1 else role1.name
     name2=t2["name"] if t2 else role2.name
-    thread_name=_clean_thread_name(f"{e1}{name1} vs {e2}{name2}")
+    tname=_clean_thread_name(f"{e1}{name1} vs {e2}{name2}")
 
     thread=await interaction.channel.create_thread(
-        name=thread_name,type=discord.ChannelType.private_thread,
-        reason=f"Scheduling: {thread_name}")
+        name=tname,type=discord.ChannelType.private_thread,reason=f"Scheduling: {tname}")
 
     to_add=set()
-    coach_ids=[
-        t1.get("head_coach_id") if t1 else None,
-        t1.get("ahc_id") if t1 else None,
-        t2.get("head_coach_id") if t2 else None,
-        t2.get("ahc_id") if t2 else None,
-    ]
-    for uid in coach_ids:
+    for uid in [t1.get("head_coach_id") if t1 else None, t1.get("ahc_id") if t1 else None,
+                t2.get("head_coach_id") if t2 else None, t2.get("ahc_id") if t2 else None]:
         if not uid: continue
         try:
             m=(interaction.guild.get_member(int(uid)) or await interaction.guild.fetch_member(int(uid)))
             to_add.add(m)
         except: pass
-    for rid in STAFF_ROLE_IDS:
-        r=interaction.guild.get_role(rid)
-        if r: to_add.update(r.members)
+    for sid in STAFF_ROLE_IDS:
+        sr=interaction.guild.get_role(sid)
+        if sr: to_add.update(sr.members)
     to_add.add(interaction.user)
     for member in to_add:
-        try:   await thread.add_user(member)
+        try: await thread.add_user(member)
         except: pass
 
-    hc1_id=t1.get("head_coach_id") if t1 else None
-    ahc1_id=t1.get("ahc_id") if t1 else None
-    hc2_id=t2.get("head_coach_id") if t2 else None
-    ahc2_id=t2.get("ahc_id") if t2 else None
-
+    hc1=t1.get("head_coach_id") if t1 else None; ahc1=t1.get("ahc_id") if t1 else None
+    hc2=t2.get("head_coach_id") if t2 else None; ahc2=t2.get("ahc_id") if t2 else None
     def _cv(hc,ahc):
         return f"> HC: {'<@'+hc+'>' if hc else '*vacant*'}\n> AHC: {'<@'+ahc+'>' if ahc else '*vacant*'}"
-
     embed=discord.Embed(title="📅 Scheduling Thread",
         description=f"{role1.mention} **vs** {role2.mention}\n\nUse this thread to schedule your match.\nRun `/thread_delete` when done.",
         color=UFF_COLOR)
-    embed.add_field(name=name1,value=_cv(hc1_id,ahc1_id),inline=True)
-    embed.add_field(name=name2,value=_cv(hc2_id,ahc2_id),inline=True)
+    embed.add_field(name=name1,value=_cv(hc1,ahc1),inline=True)
+    embed.add_field(name=name2,value=_cv(hc2,ahc2),inline=True)
     lt=_league_thumb(interaction.guild)
     if lt: embed.set_thumbnail(url=lt)
     embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    ping_parts=[f"<@{uid}>" for uid in [hc1_id,ahc1_id,hc2_id,ahc2_id] if uid]
-    await thread.send(content=" ".join(ping_parts) or None,embed=embed,
-        allowed_mentions=discord.AllowedMentions(users=True))
+    pings=" ".join(f"<@{uid}>" for uid in [hc1,ahc1,hc2,ahc2] if uid)
+    await thread.send(content=pings or None,embed=embed,allowed_mentions=discord.AllowedMentions(users=True))
     return thread
 
 
@@ -1736,67 +1656,58 @@ async def thread_create(interaction:discord.Interaction,team1:discord.Role,team2
     if not t2:
         await interaction.followup.send(f"❌ {team2.mention} not registered.",ephemeral=True); return
     try:
-        thread=await _create_scheduling_thread(interaction,team1,team2,t1,t2,data)
+        thread=await _make_thread(interaction,team1,team2,t1,t2)
         await interaction.followup.send(f"✅ Thread created: {thread.mention}",ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("❌ Missing **Create Private Threads** permission.",ephemeral=True)
+        await interaction.followup.send("❌ Missing Create Private Threads permission.",ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Could not create thread: {e}",ephemeral=True)
 
 
 @bot.tree.command(name="schedule",
-    description="[Staff] Paste a week's schedule to auto-create all scheduling threads at once")
-@app_commands.describe(schedule_text="Paste the full schedule here — one game per line with 'vs' between teams")
+    description="[Staff] Paste a week's schedule — auto-creates all scheduling threads at once")
+@app_commands.describe(schedule_text="Paste the full schedule message here")
 async def schedule_cmd(interaction:discord.Interaction,schedule_text:str):
     await interaction.response.defer(ephemeral=True)
     if not is_staff(interaction):
         await interaction.followup.send("❌ Staff only.",ephemeral=True); return
 
-    # Parse every line that has " vs " in it
-    pairs=[]
-    for line in schedule_text.splitlines():
-        line=line.strip()
-        parts=re.split(r"\s+vs\s+",line,maxsplit=1,flags=re.IGNORECASE)
-        if len(parts)==2:
-            pairs.append((parts[0].strip(),parts[1].strip()))
+    # Parse ALL vs-pairs from the schedule text, including primetime/GOTW lines
+    pairs=_parse_schedule_pairs(schedule_text,interaction.guild)
 
     if not pairs:
         await interaction.followup.send(
-            "❌ No matchups found. Make sure each game is on its own line with **vs** between the teams.",
+            "❌ No matchups found. Each game needs to be on its own line with **vs** between the teams.",
             ephemeral=True); return
 
     data=await load_data()
     created=[]; skipped=[]
+    seen_pairs=set()  # deduplicate — same pair shouldn't make two threads
 
-    for left_str,right_str in pairs:
-        role1=_find_role_in_text(left_str,interaction.guild)
-        role2=_find_role_in_text(right_str,interaction.guild)
-        if not role1 or not role2:
-            label=f"`{left_str} vs {right_str}`"
-            skipped.append(f"{label} — couldn't find both team roles")
+    for role1,role2 in pairs:
+        key=frozenset([role1.id,role2.id])
+        if key in seen_pairs:
             continue
+        seen_pairs.add(key)
 
         t1=data["teams"].get(str(role1.id))
         t2=data["teams"].get(str(role2.id))
 
         try:
-            thread=await _create_scheduling_thread(interaction,role1,role2,t1,t2,data)
-            created.append(thread.mention)
+            thread=await _make_thread(interaction,role1,role2,t1,t2)
+            created.append(f"• {thread.mention} — **{role1.name}** vs **{role2.name}**")
         except discord.Forbidden:
             skipped.append(f"`{role1.name} vs {role2.name}` — missing Create Private Threads permission")
-            break   # if permission is missing it'll fail for all, stop early
+            break  # permission missing for all; stop early
         except Exception as e:
             skipped.append(f"`{role1.name} vs {role2.name}` — {e}")
 
-        # Small delay to avoid rate limits when creating many threads
-        await asyncio.sleep(0.75)
+        await asyncio.sleep(0.75)  # rate-limit safety between thread creates
 
     result=f"✅ Created **{len(created)}** scheduling thread(s)."
     if created:
-        # Show mentions in chunks to avoid hitting message length limit
         chunk="\n".join(created)
-        if len(chunk)<=1800: result+="\n"+chunk
-        else: result+=f"\n*(too many to list — check the channel)*"
+        result+="\n"+chunk if len(chunk)<=1800 else "\n*(too many to list — check the channel)*"
     if skipped:
         result+=f"\n\n⚠️ Skipped **{len(skipped)}**:\n"+"\n".join(skipped[:10])
         if len(skipped)>10: result+=f"\n*…and {len(skipped)-10} more*"
@@ -1807,19 +1718,19 @@ async def schedule_cmd(interaction:discord.Interaction,schedule_text:str):
 @bot.tree.command(name="thread_delete",description="[Staff/HC/AHC] Delete this scheduling thread when done")
 async def thread_delete(interaction:discord.Interaction):
     if not isinstance(interaction.channel,discord.Thread):
-        await interaction.response.send_message("❌ This command must be used **inside** a thread.",ephemeral=True); return
+        await interaction.response.send_message("❌ Must be used inside a thread.",ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     data=await load_data(); uid=str(interaction.user.id)
     is_hc=any(t.get("head_coach_id")==uid for t in data["teams"].values())
     is_ahc=any(t.get("ahc_id")==uid for t in data["teams"].values())
     if not is_staff(interaction) and not is_hc and not is_ahc:
-        await interaction.followup.send("❌ Only staff, head coaches, or assistant coaches can delete threads.",ephemeral=True); return
+        await interaction.followup.send("❌ Only staff, HCs, or AHCs can delete threads.",ephemeral=True); return
     thread=interaction.channel
-    try:   await interaction.followup.send(f"🗑️ Deleting **{thread.name}**…",ephemeral=True)
+    try: await interaction.followup.send(f"🗑️ Deleting **{thread.name}**…",ephemeral=True)
     except: pass
-    try:   await thread.delete()
-    except discord.Forbidden: print(f"[thread_delete] Missing permission to delete thread {thread.id}")
-    except Exception as e:    print(f"[thread_delete] Error: {e}")
+    try: await thread.delete()
+    except discord.Forbidden: print(f"[thread_delete] Missing permission for {thread.id}")
+    except Exception as e: print(f"[thread_delete] Error: {e}")
 
 
 if __name__=="__main__":
