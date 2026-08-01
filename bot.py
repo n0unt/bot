@@ -297,54 +297,98 @@ def _info_block(team):
     else: lines.append("assistant coach: vacant")
     return "\n".join(lines)
 
-def _nfl_embed(team, guild, action_line:str, color:int, rbx_avatar:str="") -> discord.Embed:
+async def _get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook | None:
+    """Get the first bot-owned webhook in the channel, or create one."""
+    try:
+        hooks = await channel.webhooks()
+        for h in hooks:
+            if h.user and h.user.id == bot.user.id:
+                return h
+        return await channel.create_webhook(name="UFF Transactions")
+    except discord.Forbidden:
+        return None
+    except Exception:
+        return None
+
+async def post_tx_webhook(guild, team, action_line: str, followup=None, msg="", ephemeral=True):
     """
-    NFL-style transaction embed matching the screenshot:
-      Title  : "{emoji} Full Team Name :verified: @LastWord"
-      Body   : action_line + newline + info_block
-      Thumb  : team logo (top-right inside embed)
-      Color  : team color
+    Post a transaction using a webhook so it looks exactly like the screenshot:
+      - Team logo as the avatar (left side)
+      - "Team Name :verified: @LastWord" as the sender name
+      - action_line as plain text body
+      - info block as a small embed beneath
+    Falls back to a regular embed message if webhooks are unavailable.
     """
+    ch = await get_tx_ch(guild)
+    if not ch:
+        if followup and msg: await followup.send(msg, ephemeral=ephemeral)
+        return
+
     verified  = get_verified_emoji(guild)
     team_name = team.get("name","") if team else ""
     last      = _last_word(team_name)
     em_pfx    = (team.get("emoji","")+" ") if team and team.get("emoji") else ""
-    title     = f"{em_pfx}{team_name} {verified} @{last}"
-    desc      = f"{action_line}\n\n{_info_block(team)}" if team else action_line
-    embed     = discord.Embed(title=title, description=desc, color=color)
-    embed.set_footer(text=UFF_FOOTER); embed.timestamp=datetime.utcnow()
-    # Thumbnail: team logo first, then league logo fallback
-    logo = team.get("logo_url","") if team else ""
-    if logo: embed.set_thumbnail(url=logo)
-    else:
-        lt=_league_thumb(guild)
-        if lt: embed.set_thumbnail(url=lt)
-    return embed
+    # Webhook username: "Team Name ✅ @LastWord"
+    wh_name   = f"{em_pfx}{team_name} {verified} @{last}"[:80]
+    logo      = team.get("logo_url","") if team else ""
 
+    hook = await _get_or_create_webhook(ch)
+    if hook:
+        # Small info embed below the plain-text action line
+        info_embed = discord.Embed(description=_info_block(team), color=team.get("color", UFF_COLOR))
+        info_embed.set_footer(text=UFF_FOOTER)
+        info_embed.timestamp = datetime.utcnow()
+        try:
+            await hook.send(
+                content=action_line,
+                username=wh_name,
+                avatar_url=logo or None,
+                embeds=[info_embed],
+            )
+        except Exception:
+            # Webhook failed — fall back to plain embed
+            embed = discord.Embed(title=wh_name, description=f"{action_line}\n\n{_info_block(team)}",
+                                  color=team.get("color", UFF_COLOR))
+            embed.set_footer(text=UFF_FOOTER); embed.timestamp = datetime.utcnow()
+            if logo: embed.set_thumbnail(url=logo)
+            await ch.send(embed=embed)
+    else:
+        # No webhook permission — fall back
+        embed = discord.Embed(title=wh_name, description=f"{action_line}\n\n{_info_block(team)}",
+                              color=team.get("color", UFF_COLOR))
+        embed.set_footer(text=UFF_FOOTER); embed.timestamp = datetime.utcnow()
+        if logo: embed.set_thumbnail(url=logo)
+        await ch.send(embed=embed)
+
+    if followup and msg:
+        await followup.send(msg, ephemeral=ephemeral)
+
+async def build_tx_action(action, player, team, guild) -> tuple[str, str]:
+    """Return (action_line, rbx_name) for a transaction."""
+    blox     = await bloxlink_lookup(player.id, guild.id)
+    rbx_name = blox.get("roblox_username","Unknown")
+    rbx_part = f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
+    action_line = f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part}"
+    return action_line, rbx_name
+
+async def build_coach_action(action, player, team, guild) -> str:
+    """Return action_line for a coach transaction."""
+    blox     = await bloxlink_lookup(player.id, guild.id)
+    rbx_name = blox.get("roblox_username","Unknown")
+    rbx_part = f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
+    role_lbl = "assistant coach" if "promot" in action.lower() else "regular player"
+    return f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part} to {role_lbl}"
+
+# Keep these for OfferView compatibility
 async def build_tx_embed(action,player,team,team_role,guild,color=UFF_COLOR):
-    blox=await bloxlink_lookup(player.id,guild.id)
-    rbx_name=blox.get("roblox_username","Unknown"); rbx_avatar=blox.get("avatar_url","")
-    rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
-    action_line=f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part}"
-    return _nfl_embed(team,guild,action_line,color,rbx_avatar)
+    action_line,_ = await build_tx_action(action,player,team,guild)
+    return action_line  # returns string now — callers updated below
 
 async def build_coach_embed(action,player,team,team_role,guild,color=UFF_COLOR):
-    blox=await bloxlink_lookup(player.id,guild.id)
-    rbx_name=blox.get("roblox_username","Unknown"); rbx_avatar=blox.get("avatar_url","")
-    rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
-    role_lbl="assistant coach" if "promot" in action.lower() else "regular player"
-    action_line=f"are **{action.lower()}** {player.mention} (@{player.name}){rbx_part} to {role_lbl}"
-    return _nfl_embed(team,guild,action_line,color,rbx_avatar)
+    return await build_coach_action(action,player,team,guild)
 
-async def post_tx(guild,embed,followup=None,msg="",ephemeral=True):
-    ch=await get_tx_ch(guild)
-    if ch:
-        await ch.send(embed=embed)
-        if followup and msg: await followup.send(msg,ephemeral=ephemeral)
-    else:
-        if followup:
-            try: await followup.send(embed=embed)
-            except: pass
+async def post_tx(guild,action_line,team,followup=None,msg="",ephemeral=True):
+    await post_tx_webhook(guild,team,action_line,followup=followup,msg=msg,ephemeral=ephemeral)
 
 # ── SCHEDULE PARSER ───────────────────────────────────────────────────
 def _clean_line(line:str) -> str:
@@ -471,9 +515,7 @@ class OfferView(discord.ui.View):
             except discord.Forbidden: role_failed=True
         rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
         action_line=f"are **signing** {player.mention} (@{player.name}){rbx_part}"
-        embed=_nfl_embed(team,guild,action_line,team.get("color",UFF_COLOR),rbx_avatar)
-        ch=await get_tx_ch(guild)
-        if ch: await ch.send(embed=embed)
+        await post_tx_webhook(guild,team,action_line)
         desc=f"You accepted the offer from **{self.team_name}**!\n\nWelcome to the team."
         if role_failed: desc+="\n\n⚠️ Team role couldn't be added automatically."
         ae=discord.Embed(title="✅ Offer Accepted!",description=desc,color=0x57F287)
@@ -1021,10 +1063,10 @@ async def release(interaction:discord.Interaction,player:discord.Member):
     if team_role_obj and team_role_obj in player.roles:
         try: await player.remove_roles(team_role_obj,reason=f"Released from {team['name']}")
         except discord.Forbidden: rf=True
-    embed=await build_tx_embed("released",player,team,team_role_obj,interaction.guild,color=0xED4245)
+    action_line,_=await build_tx_action("released",player,team,interaction.guild)
     msg=f"Released **{player.display_name}** from **{team['name']}**."
     if rf: msg+="\nCould not remove team role - check bot permissions."
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+    await post_tx(interaction.guild,action_line,team,followup=interaction.followup,msg=msg)
 
 @bot.tree.command(name="demand",description="Demand a release from your team (1 lifetime)")
 async def demand(interaction:discord.Interaction):
@@ -1049,10 +1091,9 @@ async def demand(interaction:discord.Interaction):
         except discord.Forbidden: rf=True
     rbx_part=f" {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
     action_line=f"{interaction.user.mention} (@{interaction.user.name}){rbx_part} has **demanded** a release"
-    embed=_nfl_embed(found_team,interaction.guild,action_line,0xED4245,rbx_avatar)
     msg=f"Your demand from **{found_team['name']}** has been posted."
     if rf: msg+="\nCould not remove team role - check bot permissions."
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+    await post_tx(interaction.guild,action_line,found_team,followup=interaction.followup,msg=msg)
 
 @bot.tree.command(name="grant_extra_demand",description="[Owner] Grant a player an extra demand token")
 @app_commands.describe(player="The player",amount="Number of extra demands (default 1)")
@@ -1089,10 +1130,10 @@ async def promote_coach(interaction:discord.Interaction,player:discord.Member):
         if hc_role and hc_role in player.roles: await player.remove_roles(hc_role,reason="Promoted to AHC")
     except discord.Forbidden: rf=True
     team_role=get_role(interaction.guild,rid)
-    embed=await build_coach_embed("assistant coach promotion",player,team,team_role,interaction.guild,color=team.get("color",UFF_COLOR))
+    action_line=await build_coach_action("assistant coach promotion",player,team,interaction.guild)
     msg=f"**{player.display_name}** promoted to AHC of **{team['name']}**."
     if rf: msg+="\nCould not update roles - check bot permissions."
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+    await post_tx(interaction.guild,action_line,team,followup=interaction.followup,msg=msg)
 
 @bot.tree.command(name="demote_coach",description="Demote the Assistant Head Coach back to player")
 @app_commands.describe(player="The AHC to demote")
@@ -1115,10 +1156,10 @@ async def demote_coach(interaction:discord.Interaction,player:discord.Member):
         if ahc_role and ahc_role in player.roles: await player.remove_roles(ahc_role,reason="Demoted from AHC")
     except discord.Forbidden: rf=True
     team_role=get_role(interaction.guild,rid)
-    embed=await build_coach_embed("assistant coach demotion",player,team,team_role,interaction.guild,color=0xED4245)
+    action_line=await build_coach_action("assistant coach demotion",player,team,interaction.guild)
     msg=f"**{player.display_name}** demoted from AHC of **{team['name']}**."
     if rf: msg+="\nCould not remove AHC role - check bot permissions."
-    await post_tx(interaction.guild,embed,followup=interaction.followup,msg=msg)
+    await post_tx(interaction.guild,action_line,team,followup=interaction.followup,msg=msg)
 
 @bot.tree.command(name="disband",description="Disband a team — removes all players and coaches")
 @app_commands.describe(confirm="Type DISBAND to confirm",team_role="(Staff only) Target team")
