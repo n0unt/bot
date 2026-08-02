@@ -297,34 +297,60 @@ def _info_block(team):
     else: lines.append("assistant coach: vacant")
     return "\n".join(lines)
 
-async def _make_team_thumbnail(logo_url: str, color_int: int) -> discord.File | None:
+async def _make_team_thumbnail(logo_url: str, color_int: int, corner_emoji_url: str = "") -> discord.File | None:
     """
-    Generate a thumbnail: solid colored square (128x128) with the team logo
-    centred on top of it. Returns a discord.File or None on failure.
-    Requires Pillow (pip install Pillow).
+    Generate the team thumbnail:
+      - 80x80 solid colour background (team color)
+      - Team logo centred on top (60% of square)
+      - Team emoji image in all 4 corners (12x12 each) if available
+    Returns a discord.File named "thumb.png", or None on failure.
     """
     try:
         from PIL import Image
-        import io, struct
+        import io
 
-        SIZE = 128
-        # Build colour background
+        SIZE    = 80
+        LOGO_PCT = 0.65   # logo takes 65% of the square
+        CORNER  = 14      # corner emoji size in pixels
+
         r = (color_int >> 16) & 0xFF
         g = (color_int >> 8)  & 0xFF
         b =  color_int        & 0xFF
         bg = Image.new("RGBA", (SIZE, SIZE), (r, g, b, 255))
 
+        # ── Centre logo ────────────────────────────────────────────────
         if logo_url:
             async with aiohttp.ClientSession() as s:
                 async with s.get(logo_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                     if resp.status == 200:
-                        raw = await resp.read()
-                        logo_img = Image.open(io.BytesIO(raw)).convert("RGBA")
-                        # Scale logo to 80% of the square, centred
-                        logo_size = int(SIZE * 0.80)
-                        logo_img  = logo_img.resize((logo_size, logo_size), Image.LANCZOS)
-                        offset    = (SIZE - logo_size) // 2
-                        bg.paste(logo_img, (offset, offset), logo_img)
+                        logo_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
+                        lsz      = int(SIZE * LOGO_PCT)
+                        logo_img = logo_img.resize((lsz, lsz), Image.LANCZOS)
+                        off      = (SIZE - lsz) // 2
+                        bg.paste(logo_img, (off, off), logo_img)
+
+        # ── Corner emoji ───────────────────────────────────────────────
+        corner_img = None
+        if corner_emoji_url:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(corner_emoji_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                        if resp.status == 200:
+                            corner_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
+                            corner_img = corner_img.resize((CORNER, CORNER), Image.LANCZOS)
+            except Exception:
+                corner_img = None
+
+        if corner_img:
+            # top-left, top-right, bottom-left, bottom-right
+            positions = [
+                (0,            0),
+                (SIZE - CORNER, 0),
+                (0,            SIZE - CORNER),
+                (SIZE - CORNER, SIZE - CORNER),
+            ]
+            for pos in positions:
+                bg.paste(corner_img, pos, corner_img)
 
         buf = io.BytesIO()
         bg.save(buf, format="PNG")
@@ -357,10 +383,21 @@ async def _send_tx(guild, team, title_line: str, body_line: str):
     ch = await get_tx_ch(guild)
     if not ch:
         return
-    color   = team.get("color", UFF_COLOR) if team else UFF_COLOR
-    logo    = team.get("logo_url","") if team else ""
-    thumb   = await _make_team_thumbnail(logo, color)
-    embed   = _tx_embed(team, guild, title_line, body_line, thumb)
+    color = team.get("color", UFF_COLOR) if team else UFF_COLOR
+    logo  = team.get("logo_url","") if team else ""
+
+    # Extract URL for team emoji if it's a custom server emoji <:name:id>
+    corner_url = ""
+    emoji_str  = team.get("emoji","") if team else ""
+    m = re.match(r"<a?:([^:>]+):(\d+)>", emoji_str)
+    if m:
+        emoji_id  = m.group(2)
+        animated  = emoji_str.startswith("<a:")
+        ext       = "gif" if animated else "png"
+        corner_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+
+    thumb = await _make_team_thumbnail(logo, color, corner_url)
+    embed = _tx_embed(team, guild, title_line, body_line, thumb)
     if thumb:
         await ch.send(file=thumb, embed=embed)
     else:
@@ -457,26 +494,69 @@ def _parse_schedule_pairs(text:str, guild:discord.Guild):
     """
     Parse ALL 'Team A vs Team B' matchups from a pasted schedule.
     Returns list of (role1, role2) tuples.
-    Works with both raw Discord source (with <@&ID> mentions) and
-    plain copied text (with @Team Name).
+
+    Strategy (two passes):
+    1. RAW PASS — scan every line for exactly two <@&ID> mentions separated
+       by 'vs'. This handles the copy-pasted Discord source with role mentions
+       and works regardless of surrounding emoji/bold/label noise.
+    2. TEXT PASS — for any line that survived cleaning and has readable team
+       names with 'vs' but no raw mentions, try name-based lookup as fallback.
     """
     pairs=[]
     seen=set()
+
     for raw_line in text.splitlines():
-        line=_clean_line(raw_line)
-        if not line: continue
-        # Must have ' vs ' to be a matchup line
-        parts=re.split(r"\s+vs\.?\s+",line,maxsplit=1,flags=re.IGNORECASE)
-        if len(parts)!=2: continue
-        left,right=parts[0].strip(),parts[1].strip()
-        if not left or not right: continue
-        r1=_role_from_segment(left,guild)
-        r2=_role_from_segment(right,guild)
-        if not r1 or not r2 or r1==r2: continue
-        key=frozenset([r1.id,r2.id])
-        if key in seen: continue
+        # ── Pass 1: extract raw <@&ID> pairs directly ─────────────────
+        # Find all role mention IDs on this line
+        mention_ids = re.findall(r"<@&(\d+)>", raw_line)
+        if len(mention_ids) >= 2:
+            # Check there's a 'vs' between the first and second mention
+            # by finding their positions
+            pos1 = raw_line.index(f"<@&{mention_ids[0]}>")
+            pos2 = raw_line.index(f"<@&{mention_ids[1]}>", pos1 + 1)
+            between = raw_line[pos1:pos2]
+            if re.search(r"\bvs\.?\b", between, re.IGNORECASE):
+                r1 = guild.get_role(int(mention_ids[0]))
+                r2 = guild.get_role(int(mention_ids[1]))
+                if r1 and r2 and r1 != r2:
+                    key = frozenset([r1.id, r2.id])
+                    if key not in seen:
+                        seen.add(key)
+                        pairs.append((r1, r2))
+                continue  # handled, skip text pass for this line
+
+        # ── Pass 2: text-based fallback (no raw mentions) ─────────────
+        # Strip noise but keep role name text
+        s = raw_line
+        s = re.sub(r"<a?:[^:>]+:\d+>", "", s)   # strip custom emoji tags
+        s = re.sub(r"<@&?\d+>", "", s)            # strip any leftover mentions
+        s = re.sub(r"\*+", "", s)                  # strip bold
+        s = re.sub(r"#\d+", "", s)                 # strip seeding numbers
+        s = re.sub(r"\(edited\)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"GOTW[^v]*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"primetime[:\s]*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"regular[:\s]*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"match\s+\S+[^v]*", "", s, flags=re.IGNORECASE)
+        s = " ".join(s.split()).strip()
+        if not s:
+            continue
+
+        parts = re.split(r"\s+vs\.?\s+", s, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) != 2:
+            continue
+        left, right = parts[0].strip(), parts[1].strip()
+        if not left or not right:
+            continue
+        r1 = _role_from_segment(left, guild)
+        r2 = _role_from_segment(right, guild)
+        if not r1 or not r2 or r1 == r2:
+            continue
+        key = frozenset([r1.id, r2.id])
+        if key in seen:
+            continue
         seen.add(key)
-        pairs.append((r1,r2))
+        pairs.append((r1, r2))
+
     return pairs
 
 # ── OFFER VIEW ────────────────────────────────────────────────────────
