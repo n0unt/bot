@@ -297,40 +297,109 @@ def _info_block(team):
     else: lines.append("assistant coach: vacant")
     return "\n".join(lines)
 
-async def _make_team_thumbnail(logo_url: str, color_int: int, corner_emoji_url: str = "") -> discord.File | None:
+def _get_gradient_colors(team_name: str, fallback_color: int) -> list[tuple[int,int,int]]:
     """
-    Generate the team thumbnail:
-      - 80x80 solid colour background (team color)
-      - Team logo centred on top (60% of square)
-      - Team emoji image in all 4 corners (12x12 each) if available
-    Returns a discord.File named "thumb.png", or None on failure.
+    Return a list of (r,g,b) tuples for the gradient background.
+    Single-color teams return a list with one entry (solid fill).
+    """
+    TEAM_GRADIENTS: dict[str, list[int]] = {
+        "rosewood":      [0xFFD700, 0x6A0DAD, 0xCC0000],   # gold → purple → red
+        "colorado":      [0xFF69B4, 0x1E90FF, 0x6A0DAD],   # pink → blue → purple
+        "vicksburg":     [0x0A0230, 0x6B00FF],              # navy → electric purple
+        "nashville":     [0x2D0057, 0x00C2FF],              # dark purple → neon blue
+        "sunny isle":    [0x006060, 0x00B6BA, 0x7FFFD4],   # teal → aqua → seafoam
+        "golden knights":[0xB8860B, 0xF5BE23, 0xFF8C00],   # deep gold → bright gold → orange
+        "deltabay":      [0x005F8A, 0x0099FC, 0x00D4FF],   # ocean blue → light cyan
+        "seattle":       [0x001A3A, 0x004A8B, 0x0080FF],   # midnight → sky blue
+        "alabama":       [0xF7ADAD, 0xC9A0DC, 0xFF6B8A],   # pink → lavender → rose
+        "windy city":    [0x1A0066, 0x4126A5, 0x7B2FBE],   # indigo → violet
+        "myrtle":        [0x0A1628, 0x215792, 0x00809A],   # navy → ocean teal
+        "warwick":       [0x0D3B1E, 0x27833D, 0x5DBB63],   # forest → lime green
+        "salt lake":     [0xFF1A1A, 0xDB0E16, 0x8B0000],   # bright red → dark red
+        "milwaukee":     [0x8B6914, 0xC5AA76, 0xE8D5A3],   # bronze → tan → cream
+        "oklahoma":      [0x3D0010, 0x67112A, 0xA01840],   # deep maroon → burgundy
+        "highridge":     [0x3A3A3A, 0x767878, 0xB0B0B0],   # charcoal → silver
+        "savannah":      [0x5C0000, 0xBB0620, 0x1A0000],   # dark red → deep black-red
+        "salisbury":     [0x010A1F, 0x052270, 0x1040A0],   # midnight → royal blue
+        "columbus":      [0x0A1F5C, 0x184DA7, 0x3A7ACC],   # deep → royal → light blue
+        "portsmouth":    [0x0060C0, 0x01A1F2, 0x80D0FF],   # royal → sky blue
+        "michigan":      [0x8B0000, 0xFE001F, 0xFF6060],   # deep → bright red
+        "shiroishi":     [0x1A1A1A, 0x4D4D4E, 0x808080],   # charcoal → silver
+        "sunny":         [0x006060, 0x00B6BA, 0x7FFFD4],   # alias for sunny isle
+    }
+    name_lc = team_name.lower()
+    for key, colors in TEAM_GRADIENTS.items():
+        if key in name_lc:
+            return [(c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF) for c in colors]
+    # Solid fallback
+    r = (fallback_color >> 16) & 0xFF
+    g = (fallback_color >> 8)  & 0xFF
+    b =  fallback_color        & 0xFF
+    return [(r, g, b)]
+
+def _draw_gradient(size: int, stops: list[tuple[int,int,int]]):
+    """Draw a left-to-right gradient and return a PIL Image."""
+    from PIL import Image
+    img = Image.new("RGBA", (size, size))
+    px  = img.load()
+    n   = len(stops)
+    if n == 1:
+        r, g, b = stops[0]
+        for x in range(size):
+            for y in range(size):
+                px[x, y] = (r, g, b, 255)
+        return img
+    for x in range(size):
+        t       = x / (size - 1)            # 0.0 → 1.0
+        seg     = t * (n - 1)               # which segment
+        i       = min(int(seg), n - 2)
+        local_t = seg - i                   # position within segment
+        r1,g1,b1 = stops[i]
+        r2,g2,b2 = stops[i+1]
+        r = int(r1 + (r2 - r1) * local_t)
+        g = int(g1 + (g2 - g1) * local_t)
+        b = int(b1 + (b2 - b1) * local_t)
+        for y in range(size):
+            px[x, y] = (r, g, b, 255)
+    return img
+
+async def _make_team_thumbnail(logo_url: str, color_int: int,
+                                corner_emoji_url: str = "",
+                                team_name: str = "") -> bytes | None:
+    """
+    Generate thumbnail image as raw PNG bytes:
+      - 80×80 gradient background (team-specific or solid)
+      - Team logo centred (65% of square)
+      - Corner emoji stamped in all 4 corners (14×14 px)
+    Returns PNG bytes or None on failure.
     """
     try:
         from PIL import Image
         import io
 
-        SIZE    = 80
-        LOGO_PCT = 0.65   # logo takes 65% of the square
-        CORNER  = 14      # corner emoji size in pixels
+        SIZE     = 80
+        LOGO_PCT = 0.65
+        CORNER   = 14
 
-        r = (color_int >> 16) & 0xFF
-        g = (color_int >> 8)  & 0xFF
-        b =  color_int        & 0xFF
-        bg = Image.new("RGBA", (SIZE, SIZE), (r, g, b, 255))
+        # ── Background (gradient or solid) ─────────────────────────────
+        stops = _get_gradient_colors(team_name, color_int)
+        bg    = _draw_gradient(SIZE, stops)
 
         # ── Centre logo ────────────────────────────────────────────────
         if logo_url:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(logo_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-                    if resp.status == 200:
-                        logo_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
-                        lsz      = int(SIZE * LOGO_PCT)
-                        logo_img = logo_img.resize((lsz, lsz), Image.LANCZOS)
-                        off      = (SIZE - lsz) // 2
-                        bg.paste(logo_img, (off, off), logo_img)
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(logo_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                        if resp.status == 200:
+                            logo_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
+                            lsz      = int(SIZE * LOGO_PCT)
+                            logo_img = logo_img.resize((lsz, lsz), Image.LANCZOS)
+                            off      = (SIZE - lsz) // 2
+                            bg.paste(logo_img, (off, off), logo_img)
+            except Exception:
+                pass
 
         # ── Corner emoji ───────────────────────────────────────────────
-        corner_img = None
         if corner_emoji_url:
             try:
                 async with aiohttp.ClientSession() as s:
@@ -338,39 +407,21 @@ async def _make_team_thumbnail(logo_url: str, color_int: int, corner_emoji_url: 
                         if resp.status == 200:
                             corner_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
                             corner_img = corner_img.resize((CORNER, CORNER), Image.LANCZOS)
+                            for pos in [(0,0),(SIZE-CORNER,0),(0,SIZE-CORNER),(SIZE-CORNER,SIZE-CORNER)]:
+                                bg.paste(corner_img, pos, corner_img)
             except Exception:
-                corner_img = None
-
-        if corner_img:
-            # top-left, top-right, bottom-left, bottom-right
-            positions = [
-                (0,            0),
-                (SIZE - CORNER, 0),
-                (0,            SIZE - CORNER),
-                (SIZE - CORNER, SIZE - CORNER),
-            ]
-            for pos in positions:
-                bg.paste(corner_img, pos, corner_img)
+                pass
 
         buf = io.BytesIO()
         bg.save(buf, format="PNG")
-        buf.seek(0)
-        return discord.File(buf, filename="thumb.png")
+        return buf.getvalue()   # return raw bytes — caller creates File each time
     except Exception:
         return None
 
-def _tx_embed(team, guild, title_line: str, body_line: str, thumb_file: discord.File | None) -> discord.Embed:
-    """
-    Build the transaction embed matching the screenshots:
-      Colored left bar  = team color
-      Title             = "Team Name :verified: @LastWord"
-      Description       = "are signing @player (@name) ✓ rbxname"
-      Thumbnail         = colored square + team logo (attached file)
-      Footer            = UFF footer + timestamp
-    """
+def _tx_embed(team, guild, title_line: str, body_line: str, has_thumb: bool) -> discord.Embed:
     color = team.get("color", UFF_COLOR) if team else UFF_COLOR
     embed = discord.Embed(title=title_line, description=body_line, color=color)
-    if thumb_file:
+    if has_thumb:
         embed.set_thumbnail(url="attachment://thumb.png")
     elif team and team.get("logo_url"):
         embed.set_thumbnail(url=team["logo_url"])
@@ -383,24 +434,28 @@ async def _send_tx(guild, team, title_line: str, body_line: str):
     ch = await get_tx_ch(guild)
     if not ch:
         return
-    color = team.get("color", UFF_COLOR) if team else UFF_COLOR
-    logo  = team.get("logo_url","") if team else ""
+    color      = team.get("color", UFF_COLOR) if team else UFF_COLOR
+    logo       = team.get("logo_url","") if team else ""
+    team_name  = team.get("name","") if team else ""
 
-    # Extract URL for team emoji if it's a custom server emoji <:name:id>
+    # Corner emoji URL from stored emoji string e.g. <:OKC:1234>
     corner_url = ""
     emoji_str  = team.get("emoji","") if team else ""
-    m = re.match(r"<a?:([^:>]+):(\d+)>", emoji_str)
+    m = re.match(r"<a?:[^:>]+:(\d+)>", emoji_str)
     if m:
-        emoji_id  = m.group(2)
-        animated  = emoji_str.startswith("<a:")
-        ext       = "gif" if animated else "png"
-        corner_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+        ext        = "gif" if emoji_str.startswith("<a:") else "png"
+        corner_url = f"https://cdn.discordapp.com/emojis/{m.group(1)}.{ext}"
 
-    thumb = await _make_team_thumbnail(logo, color, corner_url)
-    embed = _tx_embed(team, guild, title_line, body_line, thumb)
-    if thumb:
-        await ch.send(file=thumb, embed=embed)
+    png_bytes = await _make_team_thumbnail(logo, color, corner_url, team_name)
+
+    if png_bytes:
+        import io
+        # Create a fresh File object from the bytes — avoids "seek on closed file" bug
+        thumb_file = discord.File(io.BytesIO(png_bytes), filename="thumb.png")
+        embed      = _tx_embed(team, guild, title_line, body_line, has_thumb=True)
+        await ch.send(file=thumb_file, embed=embed)
     else:
+        embed = _tx_embed(team, guild, title_line, body_line, has_thumb=False)
         await ch.send(embed=embed)
 
 async def build_tx_action(action, player, team, guild):
