@@ -418,53 +418,66 @@ async def _make_team_thumbnail(logo_url: str, color_int: int,
     except Exception:
         return None
 
-def _tx_embed(team, guild, title_line: str, body_line: str, has_thumb: bool) -> discord.Embed:
+def _tx_embed(team, guild, title_line: str, body_line: str, thumb_url: str = "") -> discord.Embed:
     color = team.get("color", UFF_COLOR) if team else UFF_COLOR
     embed = discord.Embed(title=title_line, description=body_line, color=color)
-    if has_thumb:
-        embed.set_thumbnail(url="attachment://thumb.png")
-    elif team and team.get("logo_url"):
-        embed.set_thumbnail(url=team["logo_url"])
-    embed.set_footer(text=UFF_FOOTER)
-    embed.timestamp = datetime.utcnow()
+    if thumb_url:
+        embed.set_thumbnail(url=thumb_url)
+    # No footer, no timestamp — clean look matching the reference screenshots
     return embed
 
 async def _send_tx(guild, team, title_line: str, body_line: str):
-    """Send a transaction embed to the transactions channel."""
+    """Send a clean transaction embed with thumbnail to the transactions channel."""
     ch = await get_tx_ch(guild)
     if not ch:
         return
-    color      = team.get("color", UFF_COLOR) if team else UFF_COLOR
-    logo       = team.get("logo_url","") if team else ""
-    team_name  = team.get("name","") if team else ""
 
-    # Corner emoji URL from stored emoji string e.g. <:OKC:1234>
+    color     = team.get("color", UFF_COLOR) if team else UFF_COLOR
+    logo      = team.get("logo_url","") if team else ""
+    team_name = team.get("name","") if team else ""
+
+    # Corner emoji CDN URL from stored emoji string e.g. <:OKC:1234>
     corner_url = ""
     emoji_str  = team.get("emoji","") if team else ""
-    m = re.match(r"<a?:[^:>]+:(\d+)>", emoji_str)
-    if m:
+    em = re.match(r"<a?:[^:>]+:(\d+)>", emoji_str)
+    if em:
         ext        = "gif" if emoji_str.startswith("<a:") else "png"
-        corner_url = f"https://cdn.discordapp.com/emojis/{m.group(1)}.{ext}"
+        corner_url = f"https://cdn.discordapp.com/emojis/{em.group(1)}.{ext}"
 
+    # Generate the thumbnail PNG bytes
     png_bytes = await _make_team_thumbnail(logo, color, corner_url, team_name)
 
+    thumb_url = ""
     if png_bytes:
         import io
-        # Create a fresh File object from the bytes — avoids "seek on closed file" bug
-        thumb_file = discord.File(io.BytesIO(png_bytes), filename="thumb.png")
-        embed      = _tx_embed(team, guild, title_line, body_line, has_thumb=True)
-        await ch.send(file=thumb_file, embed=embed)
-    else:
-        embed = _tx_embed(team, guild, title_line, body_line, has_thumb=False)
-        await ch.send(embed=embed)
+        # Upload the image as a standalone message, grab CDN URL, then delete it.
+        # This gives us a stable CDN URL to embed as thumbnail without showing
+        # the raw file in the transactions channel.
+        try:
+            tmp = await ch.send(
+                file=discord.File(io.BytesIO(png_bytes), filename="thumb.png"),
+                silent=True,
+            )
+            # Get the attachment CDN URL
+            if tmp.attachments:
+                thumb_url = tmp.attachments[0].url
+            await tmp.delete()
+        except Exception:
+            thumb_url = logo  # fallback to plain logo URL
+
+    if not thumb_url:
+        thumb_url = logo  # always fallback to logo if generation failed
+
+    embed = _tx_embed(team, guild, title_line, body_line, thumb_url)
+    await ch.send(embed=embed)
 
 async def build_tx_action(action, player, team, guild):
     """Return (title_line, body_line) for a player transaction."""
     verified  = get_verified_emoji(guild)
     team_name = team.get("name","") if team else ""
     last      = _last_word(team_name)
-    em_pfx    = (team.get("emoji","")+" ") if team and team.get("emoji") else ""
-    title_line = f"{em_pfx}{team_name} {verified} @{last}"
+    # No emoji prefix in title — clean look matching the Vikings screenshot
+    title_line = f"{team_name} {verified} @{last}"
 
     blox     = await bloxlink_lookup(player.id, guild.id)
     rbx_name = blox.get("roblox_username","Unknown")
@@ -477,8 +490,7 @@ async def build_coach_action(action, player, team, guild):
     verified  = get_verified_emoji(guild)
     team_name = team.get("name","") if team else ""
     last      = _last_word(team_name)
-    em_pfx    = (team.get("emoji","")+" ") if team and team.get("emoji") else ""
-    title_line = f"{em_pfx}{team_name} {verified} @{last}"
+    title_line = f"{team_name} {verified} @{last}"
 
     blox     = await bloxlink_lookup(player.id, guild.id)
     rbx_name = blox.get("roblox_username","Unknown")
@@ -1240,8 +1252,7 @@ async def demand(interaction:discord.Interaction):
     verified  = get_verified_emoji(interaction.guild)
     team_name = found_team.get("name","")
     last      = _last_word(team_name)
-    em_pfx    = (found_team.get("emoji","")+" ") if found_team.get("emoji") else ""
-    title_line = f"{em_pfx}{team_name} {verified} @{last}"
+    title_line = f"{team_name} {verified} @{last}"
     rbx_part  = f" ✓ {rbx_name}" if rbx_name and rbx_name!="Unknown" else ""
     body_line = f"{interaction.user.mention} (@{interaction.user.name}){rbx_part} has **demanded** a release"
     msg=f"Your demand from **{found_team['name']}** has been posted."
