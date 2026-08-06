@@ -297,48 +297,8 @@ def _info_block(team):
     else: lines.append("assistant coach: vacant")
     return "\n".join(lines)
 
-def _get_gradient_colors(team_name: str, fallback_color: int) -> list[tuple[int,int,int]]:
-    """
-    Return a list of (r,g,b) tuples for the gradient background.
-    Single-color teams return a list with one entry (solid fill).
-    """
-    TEAM_GRADIENTS: dict[str, list[int]] = {
-        "rosewood":      [0xFFD700, 0x6A0DAD, 0xCC0000],   # gold → purple → red
-        "colorado":      [0xFF69B4, 0x1E90FF, 0x6A0DAD],   # pink → blue → purple
-        "vicksburg":     [0x0A0230, 0x6B00FF],              # navy → electric purple
-        "nashville":     [0x2D0057, 0x00C2FF],              # dark purple → neon blue
-        "sunny isle":    [0x006060, 0x00B6BA, 0x7FFFD4],   # teal → aqua → seafoam
-        "golden knights":[0xB8860B, 0xF5BE23, 0xFF8C00],   # deep gold → bright gold → orange
-        "deltabay":      [0x005F8A, 0x0099FC, 0x00D4FF],   # ocean blue → light cyan
-        "seattle":       [0x001A3A, 0x004A8B, 0x0080FF],   # midnight → sky blue
-        "alabama":       [0xF7ADAD, 0xC9A0DC, 0xFF6B8A],   # pink → lavender → rose
-        "windy city":    [0x1A0066, 0x4126A5, 0x7B2FBE],   # indigo → violet
-        "myrtle":        [0x0A1628, 0x215792, 0x00809A],   # navy → ocean teal
-        "warwick":       [0x0D3B1E, 0x27833D, 0x5DBB63],   # forest → lime green
-        "salt lake":     [0xFF1A1A, 0xDB0E16, 0x8B0000],   # bright red → dark red
-        "milwaukee":     [0x8B6914, 0xC5AA76, 0xE8D5A3],   # bronze → tan → cream
-        "oklahoma":      [0x3D0010, 0x67112A, 0xA01840],   # deep maroon → burgundy
-        "highridge":     [0x3A3A3A, 0x767878, 0xB0B0B0],   # charcoal → silver
-        "savannah":      [0x5C0000, 0xBB0620, 0x1A0000],   # dark red → deep black-red
-        "salisbury":     [0x010A1F, 0x052270, 0x1040A0],   # midnight → royal blue
-        "columbus":      [0x0A1F5C, 0x184DA7, 0x3A7ACC],   # deep → royal → light blue
-        "portsmouth":    [0x0060C0, 0x01A1F2, 0x80D0FF],   # royal → sky blue
-        "michigan":      [0x8B0000, 0xFE001F, 0xFF6060],   # deep → bright red
-        "shiroishi":     [0x1A1A1A, 0x4D4D4E, 0x808080],   # charcoal → silver
-        "sunny":         [0x006060, 0x00B6BA, 0x7FFFD4],   # alias for sunny isle
-    }
-    name_lc = team_name.lower()
-    for key, colors in TEAM_GRADIENTS.items():
-        if key in name_lc:
-            return [(c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF) for c in colors]
-    # Solid fallback
-    r = (fallback_color >> 16) & 0xFF
-    g = (fallback_color >> 8)  & 0xFF
-    b =  fallback_color        & 0xFF
-    return [(r, g, b)]
-
 def _draw_gradient(size: int, stops: list[tuple[int,int,int]]):
-    """Draw a left-to-right gradient and return a PIL Image."""
+    """Draw a left-to-right gradient PIL Image from color stops."""
     from PIL import Image
     img = Image.new("RGBA", (size, size))
     px  = img.load()
@@ -350,28 +310,85 @@ def _draw_gradient(size: int, stops: list[tuple[int,int,int]]):
                 px[x, y] = (r, g, b, 255)
         return img
     for x in range(size):
-        t       = x / (size - 1)            # 0.0 → 1.0
-        seg     = t * (n - 1)               # which segment
+        t       = x / (size - 1)
+        seg     = t * (n - 1)
         i       = min(int(seg), n - 2)
-        local_t = seg - i                   # position within segment
-        r1,g1,b1 = stops[i]
-        r2,g2,b2 = stops[i+1]
-        r = int(r1 + (r2 - r1) * local_t)
-        g = int(g1 + (g2 - g1) * local_t)
-        b = int(b1 + (b2 - b1) * local_t)
+        lt      = seg - i
+        r1,g1,b1 = stops[i];  r2,g2,b2 = stops[i+1]
+        r = int(r1 + (r2-r1)*lt); g = int(g1 + (g2-g1)*lt); b = int(b1 + (b2-b1)*lt)
         for y in range(size):
             px[x, y] = (r, g, b, 255)
     return img
+
+async def _sample_logo_colors(logo_url: str, n: int = 3) -> list[tuple[int,int,int]] | None:
+    """
+    Download the team logo and extract the N most visually distinct
+    dominant colors from it using k-means-style quantization via Pillow.
+    Returns a list of (r,g,b) tuples sorted darkest → lightest,
+    or None if the logo can't be fetched/processed.
+    Only colors with saturation > 20 and brightness > 20 are kept
+    so near-black and near-white outline pixels don't dominate.
+    """
+    try:
+        from PIL import Image
+        import io, colorsys
+        async with aiohttp.ClientSession() as s:
+            async with s.get(logo_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status != 200: return None
+                raw = await resp.read()
+
+        img = Image.open(io.BytesIO(raw)).convert("RGBA")
+        # Reduce to palette of 16 colors — fast, built-in quantizer
+        small = img.resize((64, 64), Image.LANCZOS)
+        # Flatten to RGB, discard transparent pixels
+        pixels = []
+        for px in small.getdata():
+            r, g, b, a = px
+            if a < 64: continue          # skip transparent
+            pixels.append((r, g, b))
+        if not pixels: return None
+
+        # Quantize: convert to palette image then read palette
+        rgb_img = Image.new("RGB", (len(pixels), 1))
+        rgb_img.putdata(pixels)
+        palette_img = rgb_img.quantize(colors=16, method=Image.Quantize.FASTOCTREE)
+        palette = palette_img.getpalette()[:16*3]
+        colors_rgb = [(palette[i*3], palette[i*3+1], palette[i*3+2])
+                      for i in range(16)]
+
+        # Filter out near-black, near-white, near-grey
+        def _ok(rgb):
+            r,g,b = [x/255 for x in rgb]
+            h,s,v = colorsys.rgb_to_hsv(r,g,b)
+            return s > 0.20 and 0.12 < v < 0.97
+        vivid = [c for c in colors_rgb if _ok(c)]
+        if not vivid: vivid = colors_rgb  # fallback: use all
+
+        # Pick N most distinct colors by maximising pairwise distance
+        def _dist(a, b):
+            return sum((a[i]-b[i])**2 for i in range(3)) ** 0.5
+        picked = [vivid[0]]
+        while len(picked) < n and len(picked) < len(vivid):
+            best = max(vivid, key=lambda c: min(_dist(c, p) for p in picked)
+                       if c not in picked else -1)
+            if best in picked: break
+            picked.append(best)
+
+        # Sort darkest → lightest (left side darker, right brighter)
+        picked.sort(key=lambda c: sum(c))
+        return picked
+    except Exception:
+        return None
 
 async def _make_team_thumbnail(logo_url: str, color_int: int,
                                 corner_emoji_url: str = "",
                                 team_name: str = "") -> bytes | None:
     """
-    Generate thumbnail image as raw PNG bytes:
-      - 80×80 gradient background (team-specific or solid)
-      - Team logo centred (65% of square)
-      - Corner emoji stamped in all 4 corners (14×14 px)
-    Returns PNG bytes or None on failure.
+    Generate thumbnail PNG bytes (80×80):
+      - Background: gradient sampled from the team logo colors.
+        If logo color sampling fails, falls back to solid team color.
+      - Centre: team logo (65% of square)
+      - Corners: team emoji (14×14 px) in all 4 corners, if available
     """
     try:
         from PIL import Image
@@ -381,9 +398,14 @@ async def _make_team_thumbnail(logo_url: str, color_int: int,
         LOGO_PCT = 0.65
         CORNER   = 14
 
-        # ── Background (gradient or solid) ─────────────────────────────
-        stops = _get_gradient_colors(team_name, color_int)
-        bg    = _draw_gradient(SIZE, stops)
+        # ── Background: sample logo colors for gradient ────────────────
+        stops = None
+        if logo_url:
+            stops = await _sample_logo_colors(logo_url, n=3)
+        if not stops:
+            r=(color_int>>16)&0xFF; g=(color_int>>8)&0xFF; b=color_int&0xFF
+            stops = [(r, g, b)]
+        bg = _draw_gradient(SIZE, stops)
 
         # ── Centre logo ────────────────────────────────────────────────
         if logo_url:
@@ -399,22 +421,22 @@ async def _make_team_thumbnail(logo_url: str, color_int: int,
             except Exception:
                 pass
 
-        # ── Corner emoji ───────────────────────────────────────────────
+        # ── Corner emoji (team emoji, not the logo) ────────────────────
         if corner_emoji_url:
             try:
                 async with aiohttp.ClientSession() as s:
                     async with s.get(corner_emoji_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                         if resp.status == 200:
-                            corner_img = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
-                            corner_img = corner_img.resize((CORNER, CORNER), Image.LANCZOS)
+                            ce = Image.open(io.BytesIO(await resp.read())).convert("RGBA")
+                            ce = ce.resize((CORNER, CORNER), Image.LANCZOS)
                             for pos in [(0,0),(SIZE-CORNER,0),(0,SIZE-CORNER),(SIZE-CORNER,SIZE-CORNER)]:
-                                bg.paste(corner_img, pos, corner_img)
+                                bg.paste(ce, pos, ce)
             except Exception:
                 pass
 
         buf = io.BytesIO()
         bg.save(buf, format="PNG")
-        return buf.getvalue()   # return raw bytes — caller creates File each time
+        return buf.getvalue()
     except Exception:
         return None
 
@@ -870,48 +892,54 @@ class CasualPickupView(discord.ui.View):
                 n.set_footer(text=UFF_FOOTER); await c.send(embed=n)
             except: pass
 
-async def _run_casual(interaction,opponent,game_link,your_team,opponent_team):
+async def _run_casual(interaction, opponent, game_link):
     await interaction.response.defer(ephemeral=True)
     if (not ({r.id for r in interaction.user.roles}&PICKUP_ALLOWED_ROLE_IDS) and not is_admin(interaction)):
-        await interaction.followup.send("❌ Missing required role.",ephemeral=True); return
+        await interaction.followup.send("Missing required role.",ephemeral=True); return
     if opponent.id==interaction.user.id:
-        await interaction.followup.send("❌ Can't challenge yourself!",ephemeral=True); return
+        await interaction.followup.send("Can't challenge yourself!",ephemeral=True); return
     if opponent.bot:
-        await interaction.followup.send("❌ Can't challenge a bot!",ephemeral=True); return
+        await interaction.followup.send("Can't challenge a bot!",ephemeral=True); return
     data=await load_data(); _expire_casual(data)
     uid=str(interaction.user.id); oid=str(opponent.id)
     for m in data.get("casual_pending",{}).values():
         if m["challenger_id"]==uid or m["opponent_id"]==uid:
-            await interaction.followup.send("❌ You already have a pending casual.",ephemeral=True); return
+            await interaction.followup.send("You already have a pending casual.",ephemeral=True); return
         if m["challenger_id"]==oid or m["opponent_id"]==oid:
-            await interaction.followup.send(f"❌ **{opponent.display_name}** already has a pending casual.",ephemeral=True); return
+            await interaction.followup.send(f"**{opponent.display_name}** already has a pending casual.",ephemeral=True); return
+
+    # Auto-detect teams from roles
+    your_team_display, _     = _get_team_display(interaction.user, data)
+    opponent_team_display, _ = _get_team_display(opponent, data)
+
     get_player(data,interaction.user.id)["last_game"]=datetime.utcnow().isoformat()
     mid=f"casual_{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
     data.setdefault("casual_pending",{})[mid]={
         "challenger_id":str(interaction.user.id),"opponent_id":str(opponent.id),
         "challenger_name":interaction.user.display_name,"opponent_name":opponent.display_name,
-        "challenger_team":your_team,"opponent_team":opponent_team,"game_link":game_link,
+        "challenger_team":your_team_display,"opponent_team":opponent_team_display,"game_link":game_link,
         "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id}
     await save_data(data)
     lt=_league_thumb(interaction.guild)
-    dm=discord.Embed(title="🏈 Casual Pickup Challenge!",
+    dm=discord.Embed(title="Casual Pickup Challenge!",
         description=f"**{interaction.user.display_name}** wants a casual. Expires **30 min**.",color=CASUAL_COLOR)
-    dm.add_field(name=f"🟡 {interaction.user.display_name}",value=f"`{interaction.user.name}`\n**{your_team}**",inline=True)
+    dm.add_field(name=f"🟡 {interaction.user.display_name}",value=f"`{interaction.user.name}`\n{your_team_display}",inline=True)
     dm.add_field(name="\u200b",value="**— VS —**",inline=True)
-    dm.add_field(name=f"🔵 {opponent.display_name}",value=f"`{opponent.name}`\n**{opponent_team}**",inline=True)
-    dm.add_field(name="🔗 Game Link",value=f"[Click here →]({game_link})",inline=False)
+    dm.add_field(name=f"🔵 {opponent.display_name}",value=f"`{opponent.name}`\n{opponent_team_display}",inline=True)
+    dm.add_field(name="Game Link",value=f"[Click here]({game_link})",inline=False)
     dm.add_field(name="\u200b",value="⚠️ **NOT ranked** — no ELO changes.",inline=False)
     if UFF_BANNER: dm.set_image(url=UFF_BANNER)
     if lt: dm.set_thumbnail(url=lt)
     dm.set_footer(text=UFF_FOOTER); dm.timestamp=datetime.utcnow()
     view=CasualPickupView(mid,interaction.user.id,opponent.id,interaction.user.display_name,
-        opponent.display_name,your_team,opponent_team,game_link,interaction.guild.id)
+        opponent.display_name,your_team_display,opponent_team_display,game_link,interaction.guild.id)
     try: await opponent.send(embed=dm,view=view)
     except discord.Forbidden:
         data.get("casual_pending",{}).pop(mid,None); await save_data(data)
-        await interaction.followup.send(f"❌ Can't DM **{opponent.display_name}**.",ephemeral=True); return
-    ack=discord.Embed(title="📨 Casual Sent!",description=f"Challenge sent to **{opponent.display_name}**. Posted publicly only if accepted.",color=0x57F287)
-    ack.set_footer(text=f"{UFF_FOOTER} • 30-minute window")
+        await interaction.followup.send(f"Can't DM **{opponent.display_name}**.",ephemeral=True); return
+    ack=discord.Embed(title="Casual Sent!",
+        description=f"Sent to **{opponent.display_name}**.\n\n🟡 You: {your_team_display}\n🔵 Them: {opponent_team_display}\n\nPosted publicly only if accepted.",
+        color=0x57F287)
     await interaction.followup.send(embed=ack,ephemeral=True)
 
 # ── SUSPENSION UI ─────────────────────────────────────────────────────
@@ -1446,10 +1474,24 @@ async def stream_post(interaction:discord.Interaction,season:str,series:str,
 # PICKUP COMMANDS
 # ══════════════════════════════════════════════════════════════════════
 
+def _get_team_display(member: discord.Member, data: dict) -> tuple[str, str]:
+    """
+    Return (emoji_team_str, team_name) for a member by checking their roles
+    against registered teams. Falls back to their display name if not found.
+    emoji_team_str = "<:emoji:id> Team Name" or just "Team Name"
+    """
+    member_role_ids = {str(r.id) for r in member.roles}
+    for rid, team in data.get("teams", {}).items():
+        if rid in member_role_ids:
+            emoji = team.get("emoji", "")
+            name  = team.get("name", "")
+            display = f"{emoji} {name}".strip() if emoji else name
+            return display, name
+    return member.display_name, member.display_name
+
 @bot.tree.command(name="pickup_ranked",description="Challenge another player to a ranked UFF pickup")
-@app_commands.describe(opponent="The player to challenge",game_link="Roblox game link",
-    your_team="Your team name",opponent_team="Opponent's team name")
-async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,game_link:str,your_team:str,opponent_team:str):
+@app_commands.describe(opponent="The player to challenge", game_link="Roblox game link")
+async def pickup_ranked(interaction:discord.Interaction, opponent:discord.Member, game_link:str):
     await interaction.response.defer(ephemeral=True)
     if (not ({r.id for r in interaction.user.roles}&PICKUP_ALLOWED_ROLE_IDS) and not is_admin(interaction)):
         await interaction.followup.send("Missing required role.",ephemeral=True); return
@@ -1464,83 +1506,129 @@ async def pickup_ranked(interaction:discord.Interaction,opponent:discord.Member,
             await interaction.followup.send("You already have an active pending challenge.",ephemeral=True); return
         if m["challenger_id"]==oid or m["opponent_id"]==oid:
             await interaction.followup.send(f"**{opponent.display_name}** already has a pending challenge.",ephemeral=True); return
+
+    # Check cooldown for BOTH players
     cd,remaining=on_cooldown(data,interaction.user.id)
     if cd:
-        e=discord.Embed(title="cooldown active",description=f"You can challenge again in **{remaining}**.",color=0xE84040)
-        e.set_footer(text=UFF_FOOTER)
+        e=discord.Embed(title="cooldown active",
+            description=f"You played recently. You can challenge again in **{remaining}**.",color=0xE84040)
         await interaction.followup.send(embed=e,ephemeral=True); return
+    cd2,remaining2=on_cooldown(data,opponent.id)
+    if cd2:
+        e=discord.Embed(title="opponent on cooldown",
+            description=f"**{opponent.display_name}** played recently and can't accept for **{remaining2}**.",color=0xE84040)
+        await interaction.followup.send(embed=e,ephemeral=True); return
+
+    # Auto-detect teams from roles
+    your_team_display, your_team_name         = _get_team_display(interaction.user, data)
+    opponent_team_display, opponent_team_name = _get_team_display(opponent, data)
+
     p1=get_player(data,interaction.user.id); p1["username"]=interaction.user.display_name
-    p2=get_player(data,opponent.id); p2["username"]=opponent.display_name
-    p1["last_game"]=datetime.utcnow().isoformat()
+    p2=get_player(data,opponent.id);         p2["username"]=opponent.display_name
+    now_iso=datetime.utcnow().isoformat()
+    # Set last_game NOW for both — cooldown starts at challenge time, not acceptance
+    p1["last_game"]=now_iso
+    p2["last_game"]=now_iso
     mid=f"{interaction.user.id}_{opponent.id}_{int(datetime.utcnow().timestamp())}"
     data.setdefault("pending",{})[mid]={
         "challenger_id":str(interaction.user.id),"opponent_id":str(opponent.id),
         "challenger_name":interaction.user.display_name,"opponent_name":opponent.display_name,
-        "challenger_team":your_team,"opponent_team":opponent_team,"game_link":game_link,
-        "timestamp":datetime.utcnow().isoformat(),"match_id":mid,"guild_id":interaction.guild.id}
+        "challenger_team":your_team_display,"opponent_team":opponent_team_display,
+        "game_link":game_link,"timestamp":now_iso,
+        "match_id":mid,"guild_id":interaction.guild.id}
     await save_data(data)
     r1,e1,_=get_rank(p1["elo"]); r2,e2,_=get_rank(p2["elo"]); lt=_league_thumb(interaction.guild)
-    dm=discord.Embed(title="Ranked Pickup Challenge!",description=f"**{interaction.user.display_name}** wants a ranked pickup. Expires **30 min**.",color=UFF_COLOR)
-    dm.add_field(name=f"🟡 {interaction.user.display_name}",value=f"`{interaction.user.name}`\n**{your_team}**\nRank: `{e1} {r1}`",inline=True)
+    dm=discord.Embed(title="Ranked Pickup Challenge!",
+        description=f"**{interaction.user.display_name}** wants a ranked pickup. Expires **30 min**.",color=UFF_COLOR)
+    dm.add_field(name=f"🟡 {interaction.user.display_name}",
+        value=f"`{interaction.user.name}`\n{your_team_display}\nRank: `{e1} {r1}`",inline=True)
     dm.add_field(name="\u200b",value="**— VS —**",inline=True)
-    dm.add_field(name=f"🔵 {opponent.display_name}",value=f"`{opponent.name}`\n**{opponent_team}**\nRank: `{e2} {r2}`",inline=True)
+    dm.add_field(name=f"🔵 {opponent.display_name}",
+        value=f"`{opponent.name}`\n{opponent_team_display}\nRank: `{e2} {r2}`",inline=True)
     dm.add_field(name="Game Link",value=f"[Click here]({game_link})",inline=False)
     if UFF_BANNER: dm.set_image(url=UFF_BANNER)
     if lt: dm.set_thumbnail(url=lt)
     dm.set_footer(text=f"Challenge by {interaction.user.display_name} | {UFF_FOOTER}"); dm.timestamp=datetime.utcnow()
     view=RankedPickupView(mid,interaction.user.id,opponent.id,interaction.user.display_name,
-        opponent.display_name,your_team,opponent_team,game_link,interaction.guild.id)
+        opponent.display_name,your_team_display,opponent_team_display,game_link,interaction.guild.id)
     try: await opponent.send(embed=dm,view=view)
     except discord.Forbidden:
         data.get("pending",{}).pop(mid,None); await save_data(data)
         await interaction.followup.send(f"Can't DM **{opponent.display_name}**.",ephemeral=True); return
-    ack=discord.Embed(title="Challenge Sent!",description=f"Sent to **{opponent.display_name}**. Posted publicly only if accepted.",color=0x57F287)
-    ack.set_footer(text=f"{UFF_FOOTER} • 30-minute window")
+    ack=discord.Embed(title="Challenge Sent!",
+        description=f"Sent to **{opponent.display_name}**.\n\n🟡 You: {your_team_display}\n🔵 Them: {opponent_team_display}\n\nPosted publicly only if accepted.",
+        color=0x57F287)
     await interaction.followup.send(embed=ack,ephemeral=True)
 
 @bot.tree.command(name="pickup_casual",description="Challenge to a casual pickup — no ELO")
-@app_commands.describe(opponent="Player",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
-async def pickup_casual(interaction,opponent:discord.Member,game_link:str,your_team:str,opponent_team:str):
-    await _run_casual(interaction,opponent,game_link,your_team,opponent_team)
+@app_commands.describe(opponent="Player to challenge", game_link="Roblox game link")
+async def pickup_casual(interaction, opponent:discord.Member, game_link:str):
+    await _run_casual(interaction, opponent, game_link)
 
 @bot.tree.command(name="casual_pickup",description="Challenge to a casual pickup — no ELO")
-@app_commands.describe(opponent="Player",game_link="Roblox game link",your_team="Your team",opponent_team="Opponent's team")
-async def casual_pickup(interaction,opponent:discord.Member,game_link:str,your_team:str,opponent_team:str):
-    await _run_casual(interaction,opponent,game_link,your_team,opponent_team)
+@app_commands.describe(opponent="Player to challenge", game_link="Roblox game link")
+async def casual_pickup(interaction, opponent:discord.Member, game_link:str):
+    await _run_casual(interaction, opponent, game_link)
 
 @bot.tree.command(name="pickup_results",description="Submit ranked pickup results + screenshot")
-@app_commands.describe(winner="Who won?",winner_score="Winner's score",loser_score="Loser's score",screenshot="Scoreboard screenshot")
-async def pickup_results(interaction:discord.Interaction,winner:discord.Member,winner_score:int,loser_score:int,screenshot:discord.Attachment):
+@app_commands.describe(winner="Who won?",loser="Who lost?",winner_score="Winner's score",
+                       loser_score="Loser's score",screenshot="Scoreboard screenshot")
+async def pickup_results(interaction:discord.Interaction, winner:discord.Member,
+                         loser:discord.Member, winner_score:int, loser_score:int,
+                         screenshot:discord.Attachment):
     await interaction.response.defer(ephemeral=True)
-    data=await load_data(); uid=str(interaction.user.id); pending=data.get("pending",{}); match,mkey=None,None
-    for k in sorted(pending,key=lambda k:pending[k].get("timestamp",""),reverse=True):
-        m=pending[k]
-        if m["challenger_id"]==uid or m["opponent_id"]==uid: match,mkey=m,k; break
-    if not match:
-        await interaction.followup.send("No pending ranked pickup. Use /pickup_ranked first.",ephemeral=True); return
-    c_id=int(match["challenger_id"]); o_id=int(match["opponent_id"])
-    if winner.id not in [c_id,o_id]:
-        await interaction.followup.send("Winner must be one of the two players.",ephemeral=True); return
-    loser_id=o_id if winner.id==c_id else c_id
-    loser_name=match["opponent_name"] if winner.id==c_id else match["challenger_name"]
-    wp=get_player(data,winner.id); lp=get_player(data,loser_id); wp["username"]=winner.display_name
+    if not (is_staff(interaction) or
+            interaction.user.id in [winner.id, loser.id]):
+        await interaction.followup.send("Only the players or staff can submit results.",ephemeral=True); return
+    if winner.id==loser.id:
+        await interaction.followup.send("Winner and loser can't be the same person.",ephemeral=True); return
+
+    data=await load_data()
+
+    # Clear any matching pending match
+    uid=str(interaction.user.id); pending=data.get("pending",{}); mkey=None
+    for k,m in pending.items():
+        ids={m.get("challenger_id"),m.get("opponent_id")}
+        if str(winner.id) in ids and str(loser.id) in ids:
+            mkey=k; break
+    if mkey: data["pending"].pop(mkey,None)
+
+    # Update ELO and records
+    wp=get_player(data,winner.id); lp=get_player(data,loser.id)
+    wp["username"]=winner.display_name; lp["username"]=loser.display_name
     old_w,old_l=wp["elo"],lp["elo"]
-    wp["elo"]+=WIN_ELO; lp["elo"]=max(0,lp["elo"]-LOSS_ELO); wp["wins"]+=1; lp["losses"]+=1
+    wp["elo"]+=WIN_ELO; lp["elo"]=max(0,lp["elo"]-LOSS_ELO)
+    wp["wins"]+=1; lp["losses"]+=1
+
+    # Auto-detect team names for the match record
+    winner_team, _ = _get_team_display(winner, data)
+    loser_team,  _ = _get_team_display(loser, data)
+
     data.setdefault("matches",[]).append({
-        "winner_id":str(winner.id),"winner_name":winner.display_name,"loser_id":str(loser_id),"loser_name":loser_name,
+        "winner_id":str(winner.id),"winner_name":winner.display_name,
+        "loser_id":str(loser.id),"loser_name":loser.display_name,
         "winner_score":winner_score,"loser_score":loser_score,
-        "challenger_team":match["challenger_team"],"opponent_team":match["opponent_team"],"date":datetime.utcnow().isoformat()})
-    data.get("pending",{}).pop(mkey,None); await save_data(data)
-    wr,we,wcolor=get_rank(wp["elo"]); lr,le,_=get_rank(lp["elo"]); lt=_league_thumb(interaction.guild)
+        "challenger_team":winner_team,"opponent_team":loser_team,
+        "date":datetime.utcnow().isoformat()})
+    await save_data(data)
+
+    wr,we,wcolor=get_rank(wp["elo"]); lr,le,_=get_rank(lp["elo"])
+    lt=_league_thumb(interaction.guild)
     embed=discord.Embed(title="pickup results",color=wcolor)
-    embed.add_field(name="Winner",
-        value=f"<@{winner.id}> **{winner.display_name}**\nScore: **{winner_score}**\nELO: `{old_w}` → `{wp['elo']}` **(+{WIN_ELO})**\nRank: `{we} {wr}`",inline=True)
-    embed.add_field(name="Loser",
-        value=f"<@{loser_id}> **{loser_name}**\nScore: **{loser_score}**\nELO: `{old_l}` → `{lp['elo']}` **(-{LOSS_ELO})**\nRank: `{le} {lr}`",inline=True)
-    embed.add_field(name="Final Score",value=f"**{winner.display_name}** `{winner_score} — {loser_score}` **{loser_name}**",inline=False)
+    embed.add_field(name="🏆 Winner",
+        value=(f"<@{winner.id}> **{winner.display_name}**\n"
+               f"{winner_team}\nScore: **{winner_score}**\n"
+               f"ELO: `{old_w}` → `{wp['elo']}` **(+{WIN_ELO})**\nRank: `{we} {wr}`"),inline=True)
+    embed.add_field(name="❌ Loser",
+        value=(f"<@{loser.id}> **{loser.display_name}**\n"
+               f"{loser_team}\nScore: **{loser_score}**\n"
+               f"ELO: `{old_l}` → `{lp['elo']}` **(-{LOSS_ELO})**\nRank: `{le} {lr}`"),inline=True)
+    embed.add_field(name="Final Score",
+        value=f"**{winner.display_name}** `{winner_score} — {loser_score}` **{loser.display_name}**",inline=False)
     embed.set_image(url=screenshot.url)
     if lt: embed.set_thumbnail(url=lt)
-    embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}"); embed.timestamp=datetime.utcnow()
+    embed.set_footer(text=f"{UFF_FOOTER} • Submitted by {interaction.user.display_name}")
+    embed.timestamp=datetime.utcnow()
     ch=await get_pickup_ch(interaction.guild)
     target=ch if (ch and ch.id!=interaction.channel_id) else interaction.channel
     await interaction.followup.send("Results posted!",ephemeral=True)
@@ -1612,17 +1700,31 @@ async def reset_player(interaction:discord.Interaction,player:discord.Member):
     await save_data(data)
     await interaction.followup.send(f"Reset **{player.display_name}** ELO to `{STARTING_ELO}`.",ephemeral=True)
 
-@bot.tree.command(name="adjust_elo",description="[Admin] Manually adjust a player's ELO")
-@app_commands.describe(player="Target player",amount="ELO to add (negative to subtract)")
+@bot.tree.command(name="adjust_elo",description="[Admin] Manually adjust a player's ELO, wins, and losses")
+@app_commands.describe(player="Target player",
+                       elo="ELO to add (negative to subtract, 0 to skip)",
+                       wins="Wins to add (negative to subtract, 0 to skip)",
+                       losses="Losses to add (negative to subtract, 0 to skip)")
 @app_commands.default_permissions(administrator=True)
-async def adjust_elo(interaction:discord.Interaction,player:discord.Member,amount:int):
+async def adjust_elo(interaction:discord.Interaction, player:discord.Member,
+                     elo:int=0, wins:int=0, losses:int=0):
     await interaction.response.defer(ephemeral=True)
     if not is_admin(interaction):
         await interaction.followup.send("Admin only.",ephemeral=True); return
-    data=await load_data(); p=get_player(data,player.id); old=p["elo"]
-    p["elo"]=max(0,p["elo"]+amount); p["username"]=player.display_name; await save_data(data)
-    sign="+" if amount>=0 else ""
-    await interaction.followup.send(f"**{player.display_name}** ELO: `{old}` → `{p['elo']}` ({sign}{amount})",ephemeral=True)
+    data=await load_data(); p=get_player(data,player.id)
+    old_elo=p["elo"]; old_w=p["wins"]; old_l=p["losses"]
+    p["elo"]    = max(0, p["elo"]    + elo)
+    p["wins"]   = max(0, p["wins"]   + wins)
+    p["losses"] = max(0, p["losses"] + losses)
+    p["username"]=player.display_name
+    await save_data(data)
+    rank, emoji, _ = get_rank(p["elo"])
+    lines = [f"**{player.display_name}** updated:"]
+    if elo    != 0: lines.append(f"ELO: `{old_elo}` → `{p['elo']}` ({'+' if elo>=0 else ''}{elo})")
+    if wins   != 0: lines.append(f"Wins: `{old_w}` → `{p['wins']}` ({'+' if wins>=0 else ''}{wins})")
+    if losses != 0: lines.append(f"Losses: `{old_l}` → `{p['losses']}` ({'+' if losses>=0 else ''}{losses})")
+    lines.append(f"Rank: {emoji} `{rank}`")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="clear_cooldown",description="[Admin] Clear a player's cooldown")
 @app_commands.describe(player="Player to clear")
@@ -1790,6 +1892,69 @@ async def thread_delete(interaction:discord.Interaction):
     except: pass
     try: await thread.delete()
     except Exception as e: print(f"[thread_delete] Error: {e}")
+
+@bot.tree.command(name="season_reset",
+    description="[Admin] Reset all teams, rosters, and coaches — keeps ELO/pickup stats intact")
+@app_commands.describe(
+    confirm="Type SEASON RESET to confirm — this cannot be undone"
+)
+@app_commands.default_permissions(administrator=True)
+async def season_reset(interaction: discord.Interaction, confirm: str):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Admin only.", ephemeral=True); return
+    if confirm.upper() != "SEASON RESET":
+        await interaction.followup.send(
+            "Type `SEASON RESET` exactly in the confirm field.", ephemeral=True); return
+
+    data = await load_data()
+
+    # Count what we're clearing for the summary
+    team_count   = len(data.get("teams", {}))
+    total_roster = sum(len(t.get("roster",[])) for t in data.get("teams",{}).values())
+
+    # Wipe all team registrations, rosters, and coach assignments
+    data["teams"]        = {}
+    # Clear pending offers and pending matches — they reference teams that no longer exist
+    data["offers"]       = {}
+    data["pending"]      = {}
+    data["casual_pending"] = {}
+    # Reset demand tracking so everyone gets their demand back next season
+    data["demand_used"]  = {}
+    data["extra_demands"] = {}
+    # NOTE: "players" (ELO/pickup stats), "matches", and "suspensions" are kept intact
+
+    await save_data(data)
+
+    embed = discord.Embed(
+        title="🔄 Season Reset Complete",
+        color=UFF_COLOR,
+        description=(
+            f"All transaction data has been cleared for the new season.\n\n"
+            f"**Cleared:**\n"
+            f"• `{team_count}` team registrations\n"
+            f"• `{total_roster}` roster entries\n"
+            f"• All head coach / AHC assignments\n"
+            f"• All pending offers and challenges\n"
+            f"• All demand release tokens (everyone gets a fresh one)\n\n"
+            f"**Preserved:**\n"
+            f"• ELO ratings and pickup records\n"
+            f"• Match history\n"
+            f"• Suspension records\n\n"
+            f"Run `/set_team` for each rebranded team to re-register them."
+        )
+    )
+    embed.set_footer(text=f"Reset by {interaction.user.display_name} | {UFF_FOOTER}")
+    embed.timestamp = datetime.utcnow()
+
+    ch = await get_tx_ch(interaction.guild)
+    if ch:
+        await ch.send(embed=embed)
+    await interaction.followup.send(
+        f"✅ Season reset complete. `{team_count}` teams and `{total_roster}` roster entries cleared.\n"
+        f"ELO and pickup stats preserved. Posted summary to {ch.mention if ch else 'transactions channel'}.",
+        ephemeral=True
+    )
 
 if __name__=="__main__":
     bot.run(TOKEN)
