@@ -466,32 +466,28 @@ async def _send_tx(guild, team, title_line: str, body_line: str):
         ext        = "gif" if emoji_str.startswith("<a:") else "png"
         corner_url = f"https://cdn.discordapp.com/emojis/{em.group(1)}.{ext}"
 
-    # Generate the thumbnail PNG bytes
     png_bytes = await _make_team_thumbnail(logo, color, corner_url, team_name)
 
-    thumb_url = ""
     if png_bytes:
         import io
-        # Upload the image as a standalone message, grab CDN URL, then delete it.
-        # This gives us a stable CDN URL to embed as thumbnail without showing
-        # the raw file in the transactions channel.
+        # Send file + embed together.
+        # After sending, suppress the file attachment preview so only the embed shows.
+        thumb_file = discord.File(io.BytesIO(png_bytes), filename="thumb.png")
+        embed = discord.Embed(title=title_line, description=body_line, color=color)
+        embed.set_thumbnail(url="attachment://thumb.png")
         try:
-            tmp = await ch.send(
-                file=discord.File(io.BytesIO(png_bytes), filename="thumb.png"),
-                silent=True,
-            )
-            # Get the attachment CDN URL
-            if tmp.attachments:
-                thumb_url = tmp.attachments[0].url
-            await tmp.delete()
+            msg = await ch.send(file=thumb_file, embed=embed)
+            # Suppress the raw file attachment preview that Discord shows above the embed
+            await msg.edit(suppress=True)
         except Exception:
-            thumb_url = logo  # fallback to plain logo URL
-
-    if not thumb_url:
-        thumb_url = logo  # always fallback to logo if generation failed
-
-    embed = _tx_embed(team, guild, title_line, body_line, thumb_url)
-    await ch.send(embed=embed)
+            # suppress failed — just send embed with logo URL as fallback
+            embed2 = discord.Embed(title=title_line, description=body_line, color=color)
+            if logo: embed2.set_thumbnail(url=logo)
+            await ch.send(embed=embed2)
+    else:
+        embed = discord.Embed(title=title_line, description=body_line, color=color)
+        if logo: embed.set_thumbnail(url=logo)
+        await ch.send(embed=embed)
 
 async def build_tx_action(action, player, team, guild):
     """Return (title_line, body_line) for a player transaction."""
@@ -579,68 +575,75 @@ def _role_from_segment(seg:str, guild:discord.Guild):
         if lc in role.name.lower(): return role
     return None
 
-def _parse_schedule_pairs(text:str, guild:discord.Guild):
+def _parse_schedule_pairs(text: str, guild: discord.Guild):
     """
     Parse ALL 'Team A vs Team B' matchups from a pasted schedule.
     Returns list of (role1, role2) tuples.
 
-    Strategy (two passes):
-    1. RAW PASS — scan every line for exactly two <@&ID> mentions separated
-       by 'vs'. This handles the copy-pasted Discord source with role mentions
-       and works regardless of surrounding emoji/bold/label noise.
-    2. TEXT PASS — for any line that survived cleaning and has readable team
-       names with 'vs' but no raw mentions, try name-based lookup as fallback.
+    Strategy:
+    - For every line, collect ALL <@&ID> role mentions in order.
+    - Find the first pair where there is a 'vs' between them.
+    - If a line has no raw mentions, fall back to name-based lookup.
     """
-    pairs=[]
-    seen=set()
+    pairs = []
+    seen  = set()
 
     for raw_line in text.splitlines():
-        # ── Pass 1: extract raw <@&ID> pairs directly ─────────────────
-        # Find all role mention IDs on this line
-        mention_ids = re.findall(r"<@&(\d+)>", raw_line)
-        if len(mention_ids) >= 2:
-            # Check there's a 'vs' between the first and second mention
-            # by finding their positions
-            pos1 = raw_line.index(f"<@&{mention_ids[0]}>")
-            pos2 = raw_line.index(f"<@&{mention_ids[1]}>", pos1 + 1)
-            between = raw_line[pos1:pos2]
-            if re.search(r"\bvs\.?\b", between, re.IGNORECASE):
-                r1 = guild.get_role(int(mention_ids[0]))
-                r2 = guild.get_role(int(mention_ids[1]))
-                if r1 and r2 and r1 != r2:
-                    key = frozenset([r1.id, r2.id])
-                    if key not in seen:
-                        seen.add(key)
-                        pairs.append((r1, r2))
-                continue  # handled, skip text pass for this line
+        r1, r2 = None, None
 
-        # ── Pass 2: text-based fallback (no raw mentions) ─────────────
-        # Strip noise but keep role name text
-        s = raw_line
-        s = re.sub(r"<a?:[^:>]+:\d+>", "", s)   # strip custom emoji tags
-        s = re.sub(r"<@&?\d+>", "", s)            # strip any leftover mentions
-        s = re.sub(r"\*+", "", s)                  # strip bold
-        s = re.sub(r"#\d+", "", s)                 # strip seeding numbers
-        s = re.sub(r"\(edited\)", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"GOTW[^v]*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"primetime[:\s]*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"regular[:\s]*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"match\s+\S+[^v]*", "", s, flags=re.IGNORECASE)
-        s = " ".join(s.split()).strip()
-        if not s:
-            continue
+        # ── Pass 1: extract raw <@&ID> pairs ──────────────────────────
+        all_mentions = list(re.finditer(r"<@&(\d+)>", raw_line))
+        if len(all_mentions) >= 2:
+            # Walk all consecutive pairs looking for a 'vs' between them
+            for i in range(len(all_mentions) - 1):
+                m1, m2   = all_mentions[i], all_mentions[i + 1]
+                between  = raw_line[m1.end():m2.start()]
+                if not re.search(r"\bvs\.?\b", between, re.IGNORECASE):
+                    continue
+                role1 = guild.get_role(int(m1.group(1)))
+                role2 = guild.get_role(int(m2.group(1)))
+                if role1 and role2 and role1 != role2:
+                    r1, r2 = role1, role2
+                    break
+                # Even if bot can't resolve the role yet, try by ID
+                if not role1 or not role2:
+                    # Try fetching — use IDs as fallback key so we still make the thread
+                    id1, id2 = int(m1.group(1)), int(m2.group(1))
+                    # Create placeholder discord.Object so _make_thread can still ping
+                    fake1 = discord.Object(id=id1) if not role1 else role1
+                    fake2 = discord.Object(id=id2) if not role2 else role2
+                    if id1 != id2:
+                        r1, r2 = fake1, fake2
+                        break
 
-        parts = re.split(r"\s+vs\.?\s+", s, maxsplit=1, flags=re.IGNORECASE)
-        if len(parts) != 2:
+        # ── Pass 2: text fallback (no raw mentions on this line) ───────
+        if not r1 and not all_mentions:
+            s = raw_line
+            s = re.sub(r"<a?:[^:>]+:\d+>", "", s)
+            s = re.sub(r"<@&?\d+>", "", s)
+            s = re.sub(r"\*+", "", s)
+            s = re.sub(r"#\d+", "", s)
+            s = re.sub(r"\(edited\)", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"GOTW\W*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"primetime[:\s]*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"regular[:\s]*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"match\s+\S+", "", s, flags=re.IGNORECASE)
+            s = " ".join(s.split()).strip()
+            if s:
+                parts = re.split(r"\s+vs\.?\s+", s, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    left, right = parts[0].strip(), parts[1].strip()
+                    if left and right:
+                        r1 = _role_from_segment(left, guild)
+                        r2 = _role_from_segment(right, guild)
+
+        if not r1 or not r2:
             continue
-        left, right = parts[0].strip(), parts[1].strip()
-        if not left or not right:
+        r1_id = r1.id if hasattr(r1, "id") else int(r1)
+        r2_id = r2.id if hasattr(r2, "id") else int(r2)
+        if r1_id == r2_id:
             continue
-        r1 = _role_from_segment(left, guild)
-        r2 = _role_from_segment(right, guild)
-        if not r1 or not r2 or r1 == r2:
-            continue
-        key = frozenset([r1.id, r2.id])
+        key = frozenset([r1_id, r2_id])
         if key in seen:
             continue
         seen.add(key)
